@@ -7,9 +7,9 @@ requires-python = ">=3.12,<3.13"
 dependencies = []
 
 [dependency-groups]
-# PySpark is provided by Databricks at runtime, so it is a dev dependency locally.
+# PySpark is provided by Databricks at runtime (4.2 on serverless); pinned to match locally.
 dev = [
-    "pyspark>=4.0,<5",
+    "pyspark>=4.2,<4.3",
     "pytest>=8",
     "ruff>=0.8",
 ]
