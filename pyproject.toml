@@ -1,0 +1,33 @@
+[project]
+name = "netusage"
+version = "0.1.0"
+description = "Medallion-architecture network access analytics pipeline in PySpark (synthetic data)"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[dependency-groups]
+# PySpark is provided by Databricks at runtime, so it is a dev dependency locally.
+dev = [
+    "pyspark>=4.0,<5",
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/netusage"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

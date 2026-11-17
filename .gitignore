@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Local Spark artifacts and generated data — never commit data
+spark-warehouse/
+metastore_db/
+derby.log
+data/
+landing/
+
+.vscode/
+.idea/
+.env
