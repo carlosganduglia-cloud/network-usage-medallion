@@ -36,30 +36,34 @@ erDiagram
     VPN_RULE }o--|| AD_GROUP : "grants to"
     VPN_RULE }o--|| RESOURCE : "grants access to"
     RESOURCE ||--o{ RESOURCE_RESOLUTION : "resolves to (over time)"
-    AD_GROUP }o--o{ USER : "has members"
+    AD_GROUP ||--o{ AD_GROUP_MEMBER : has
+    USER ||--o{ AD_GROUP_MEMBER : "is"
     USER ||--o{ TRAFFIC_LOG : "connects"
 ```
 
-| Entity | Scale (synthetic) | Notes |
-|---|---|---|
-| `users` | ~100k | Some disabled |
-| `ad_groups_flat` | ~500k | Already flattened upstream: member list as an array |
-| `apps` | ~1–2k | Independent rule namespaces (department/project) |
-| `vpn_rules` | ~120k | App + gateway + resource + port spec (`"443"` or `"1-99"`) + protocol + group |
-| `resource_resolutions` | ~100–300k | Resource → IP range (`ip_start`/`ip_end` as integers; single IP ⇒ start = end, subnet ⇒ first/last) with validity period |
-| `traffic_logs` | **100M+** | One event per connection: user email, destination IP, port, protocol, ALLOW/DENY. Daily batches over ~12 months |
+| Entity | Scale (synthetic) | Landing format | Notes |
+|---|---|---|---|
+| `users` | ~100k | JSON (API pages) | Some disabled |
+| `apps` | ~1–2k | JSON (API pages) | Independent rule namespaces (department/project) |
+| `vpn_rules` | ~120k | JSON (API pages) | App + gateway + resource + port spec (`"443"` or `"1-99"`) + protocol + group |
+| `ad_group` | ~500k | CSV | Group id, name, domain |
+| `ad_group_member` | ~20M | CSV | One row per membership; already flattened upstream (no nested groups); mostly `user` members |
+| `resource_resolutions` | ~1–2M (12 months of history) | Parquet | Resource → IP range (`ip_start`/`ip_end` as integers; single IP ⇒ start = end, subnet ⇒ first/last) with `first_seen`/`last_seen` |
+| `traffic_logs` | **100M+** | CSV, daily batches | One event per connection: user email, destination IP, port, protocol, ALLOW/DENY. ~12 months |
 
 Key property of the problem: **logs don't say which rule allowed them.** A connection can be
 covered by several rules (different groups, or another app's rule on a large group), so every
 rule that *could* have allowed it counts as used.
 
-Out of scope: nested-group expansion (treated as an upstream export). See `docs/later.md`.
+**Upstream (out of scope):** the API sync service for users/apps/rules (full daily snapshots),
+the resource resolution service, and nested-group expansion. The pipeline starts from their
+exports in landing. See `docs/later.md`.
 
 ## 4. Pipeline (medallion)
 
 ```mermaid
 flowchart LR
-    G[Synthetic generator] --> L[(landing<br/>Parquet, daily batches)]
+    G[Synthetic generator] --> L[(landing<br/>JSON · CSV · Parquet)]
     L --> B[(bronze<br/>raw + ingest metadata)]
     B --> S[(silver<br/>normalized, deduped)]
     S --> M[(silver<br/>rule_matches)]
@@ -67,10 +71,14 @@ flowchart LR
     Gd --> D[Dashboard]
 ```
 
-- **Landing:** Parquet "exports", one folder per day.
-- **Bronze:** append-only Delta, with `ingest_ts`, `source_file`, `batch_date`.
+- **Landing:** upstream exports in their natural formats — JSON API pages (users, apps, rules),
+  CSV (AD groups, memberships, traffic logs), Parquet (resolutions). Logs: one folder per day.
+- **Bronze:** append-only Delta, with `ingest_ts`, `source_file`, `batch_date`. Explicit schemas;
+  malformed records captured, not dropped silently.
 - **Silver:** normalize (email case/whitespace, IP string → integer, port spec → start/end,
-  explode group members), keep ALLOW only, dedup, MERGE on `event_id`, partition by `event_date`.
+  user-only deduped memberships, latest snapshot of users/apps/rules, resolution validity from
+  `first_seen`/`last_seen`), keep ALLOW only, dedup, MERGE on `event_id`, partition by
+  `event_date`.
 - **Matching:** each log ↔ every rule whose resolved IP range contains the destination IP
   **at the event's time**, whose port range contains the port, same protocol, and whose group
   contains the user. **TBD:** join strategy (naive range join vs binning) and measurements.
