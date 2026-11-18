@@ -14,3 +14,11 @@ uv sync
 uv run pytest
 uv run ruff check .
 ```
+
+### Synthetic data
+
+```bash
+uv run python -m netusage.generator --profile small     # 1M events, 365 daily batches -> data/landing (~1 min)
+uv run python -m netusage.validation --profile small    # row counts, join-path integrity, dirty-data ratios
+uv run python -m netusage.generator --profile tiny --days 7   # seconds; add --days to validation too
+```

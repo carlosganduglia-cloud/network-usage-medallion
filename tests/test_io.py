@@ -2,6 +2,7 @@
 
 import pytest
 from pyspark.sql import Row
+from pyspark.sql import functions as F
 from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
 from netusage.io import (
@@ -123,3 +124,24 @@ def test_parquet_reads_capture_source_file(spark, tmp_path):
 def test_corrupt_rows_requires_a_landing_reader(spark):
     with pytest.raises(ValueError, match="use a landing reader"):
         corrupt_rows(spark.createDataFrame([Row(event_id="e1")]))
+
+
+def test_csv_column_pruning_hides_extra_field_rows(spark, tmp_path):
+    """Pins down a Spark gotcha the validation module depends on.
+
+    An aggregation that only needs some columns makes the CSV parser skip the rest
+    (spark.sql.csv.parser.columnPruning.enabled), and then a row with an extra field
+    is NOT flagged in _corrupt_record. Parsing every column (here via cache) catches it.
+    If this test ever fails, Spark changed the behavior; revisit validation._full_parse.
+    """
+    path = tmp_path / "extra.csv"
+    path.write_text(
+        "event_id,user_email\ne1,u1@corp.example\ne2,u2@corp.example,EXTRA\n", encoding="utf-8"
+    )
+    flagged = F.sum(F.col(CORRUPT_COLUMN).isNotNull().cast("int"))
+
+    pruned = read_csv(spark, path, SCHEMA).agg(F.count("event_id"), flagged).first()
+    full = read_csv(spark, path, SCHEMA).cache().agg(F.count("event_id"), flagged).first()
+
+    assert pruned[1] == 0
+    assert full[1] == 1

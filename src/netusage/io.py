@@ -14,6 +14,23 @@ CORRUPT_COLUMN = "_corrupt_record"
 SOURCE_COLUMN = "source_file"
 FILE_PATH_COLUMN = "_metadata.file_path"
 
+# Landing layout: one sub-directory per entity under the landing root. Traffic logs are further
+# split into Hive-style daily folders, traffic_logs/batch_date=YYYY-MM-DD/.
+LANDING_DIRS = {
+    "users": "users",
+    "apps": "apps",
+    "vpn_rules": "vpn_rules",
+    "ad_group": "ad_group",
+    "ad_group_membership": "ad_group_membership",
+    "resource_resolution": "resource_resolution",
+    "traffic_logs": "traffic_logs",
+}
+BATCH_COLUMN = "batch_date"
+
+
+def landing_path(root: str | Path, entity: str) -> str:
+    return f"{str(root).rstrip('/')}/{LANDING_DIRS[entity]}"
+
 
 def with_corrupt_column(schema: StructType) -> StructType:
     """Return a copy of ``schema`` with Spark's corrupt-record column added.
@@ -79,6 +96,10 @@ def read_parquet(spark: SparkSession, path: str | Path, schema: StructType) -> D
 def corrupt_rows(df: DataFrame) -> DataFrame:
     """Filter a landing read down to rows Spark could not parse.
 
+    Only reliable when every column gets parsed. On a raw CSV read, Spark's CSV column pruning
+    parses only the columns a query needs, and a row with an extra field then goes unflagged.
+    So count corrupt rows after a cache or in bronze, never with an aggregation on the raw files.
+
     This only filters; it deliberately does not cache. Serverless compute does
     not support ``cache()``/``persist()``, and hiding that memory decision inside
     a helper prevents callers from unpersisting it. Locally, cache the DataFrame
@@ -89,3 +110,57 @@ def corrupt_rows(df: DataFrame) -> DataFrame:
     if CORRUPT_COLUMN not in df.columns:
         raise ValueError(f"{CORRUPT_COLUMN} is missing; use a landing reader from this module")
     return df.where(F.col(CORRUPT_COLUMN).isNotNull())
+
+
+# --- Landing writers (used by the synthetic generator) -------------------------------------------
+
+
+def write_csv_lines(df: DataFrame, path: str | Path, partition_by: str | None = None) -> None:
+    """Write ``df`` as header + comma-joined lines, without any quoting.
+
+    Why not ``df.write.csv``: Spark's CSV writer quotes any value containing the delimiter, so it
+    can never produce a row with the wrong field count, and the generator needs exactly that to
+    plant malformed rows. Here the caller owns the format: values must not contain commas or
+    newlines unless a broken row is intended. NULL is written as an empty field.
+
+    Every output file starts with the header line (``enforceSchema=false`` checks the first line
+    of each file):
+
+    - ``partition_by`` set: one folder and one file per value (``batch_date=2025-01-01/``).
+      ``repartition`` puts all rows of a value in one task, and ``sortWithinPartitions`` with the
+      header's ``_order = 0`` puts the header first. The writer only re-sorts when the existing
+      order doesn't already start with the partition column, so this order survives.
+    - otherwise: a single file (fine up to the ~20M-row memberships at full scale).
+
+    Spark's text writer names files ``part-*.txt``; Spark's CSV reader doesn't care.
+    """
+    columns = [c for c in df.columns if c != partition_by]
+    line = F.concat_ws(",", *[F.coalesce(F.col(c).cast("string"), F.lit("")) for c in columns])
+    keys = [partition_by] if partition_by else []
+    body = df.select(*keys, line.alias("value"), F.lit(1).alias("_order"))
+
+    header_value = F.lit(",".join(columns)).alias("value")
+    if partition_by:
+        header = df.select(partition_by).distinct().select(partition_by, header_value)
+        out = (
+            body.unionByName(header.withColumn("_order", F.lit(0)))
+            .repartition(partition_by)
+            .sortWithinPartitions(partition_by, "_order")
+        )
+    else:
+        header = df.sparkSession.range(1).select(header_value, F.lit(0).alias("_order"))
+        out = body.unionByName(header).coalesce(1).sortWithinPartitions("_order")
+
+    writer = out.drop("_order").write.mode("overwrite")
+    if partition_by:
+        writer = writer.partitionBy(partition_by)
+    writer.text(str(path))
+
+
+def write_json_lines(df: DataFrame, path: str | Path, num_files: int = 1) -> None:
+    """One JSON object per line. NULL fields are omitted (Spark's default)."""
+    df.coalesce(num_files).write.mode("overwrite").json(str(path))
+
+
+def write_parquet(df: DataFrame, path: str | Path, num_files: int = 1) -> None:
+    df.coalesce(num_files).write.mode("overwrite").parquet(str(path))

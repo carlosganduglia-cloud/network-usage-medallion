@@ -222,9 +222,18 @@ flowchart LR
 - Schema contract tests (`tests/test_schemas.py`): join keys exist with matching types, IP columns
   are `LongType`. No Spark session needed.
 - Unit tests per transform with tiny hand-built DataFrames (local SparkSession, `pytest`).
-- Generator validation: row counts, referential integrity, dirty-data ratios; normalized emails
-  stay unique; resolution states per resource are disjoint and ordered, rows of one state share
-  their timestamps, and no state has `last_seen <= first_seen`.
+- Generator validation (`src/netusage/validation.py`, run after `netusage.generator`): row
+  counts, referential integrity along join-path steps 1–6, dirty-data ratios (binomial
+  tolerance); normalized emails stay unique; resolution states per resource are disjoint and
+  ordered, rows of one state share their timestamps, and no state has `last_seen <= first_seen`.
+  It reads through the landing readers, so it doubles as their end-to-end test. It deliberately
+  does not check rule matching; that belongs to the matching transform's tests.
+- Generator integration test (`tests/test_generator.py`): TINY profile over 5 days, asserts all
+  validation checks pass, one header-first file per batch folder, malformed rows captured, and
+  determinism under re-partitioning.
+- Known gotcha, pinned by `tests/test_io.py`: with CSV column pruning (on by default), an
+  aggregation over raw CSV files does not flag rows with an extra field in `_corrupt_record`.
+  Count corrupt rows only after every column is parsed (cache locally, or in bronze).
 - Pipeline checks: re-run idempotency, late-event placement. **TBD:** where these live.
 
 ## 9. Decisions

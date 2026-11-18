@@ -45,7 +45,23 @@ FULL = ScaleProfile(
     traffic_events=100_000_000,
 )
 
-PROFILES = {p.name: p for p in (SMALL, FULL)}
+# Seconds-fast profile for the generator's integration tests (pair it with a few-day date range).
+TINY = ScaleProfile(
+    name="tiny",
+    users=500,
+    apps=20,
+    ad_groups=1_000,
+    avg_members_per_group=10,
+    vpn_rules=600,
+    resources=400,
+    traffic_events=20_000,
+)
+
+PROFILES = {p.name: p for p in (TINY, SMALL, FULL)}
+
+# Same seed -> byte-identical landing data. The generator derives every random value by hashing
+# (SEED, purpose, row key), so values don't depend on how Spark partitions the work.
+SEED = 42
 
 
 # --- Time -------------------------------------------------------------------------------------
@@ -79,8 +95,15 @@ WIDE_PORT_RANGE_RATIO = 0.03  # rules like "1-65535"
 SUBNET_RESOURCE_RATIO = 0.10  # resources that are subnets rather than single IPs
 SUBNET_PREFIX_LENGTHS = (24, 26, 28)  # allowed subnet sizes; /24 is the largest (256 addresses)
 UNSTABLE_RESOURCE_RATIO = 0.05  # resources whose IPs change frequently
+UNSTABLE_STATE_HOURS = 18  # an unstable resource gets a new resolution state this often
+STABLE_STATE_DAYS = 120  # ...and a stable one this often (a few IP changes a year)
+MULTI_RANGE_RESOURCE_RATIO = 0.10  # single-IP resources resolving to 2 IPs at once (DNS A records)
 HUGE_GROUP_COUNT = 5  # "Domain Users"-style groups -> skew
 HUGE_GROUP_MEMBER_SHARE = 0.9  # each huge group contains this share of all users
+RULES_ON_HUGE_GROUP_RATIO = 0.05  # rules granted to a huge group -> user over-provisioning
+RANGE_PORT_RULE_RATIO = 0.15  # rules with a moderate range like "8000-8100" (wide ones above)
+UDP_RULE_RATIO = 0.10  # the rest are TCP
+NON_OPERATIONAL_RULE_RATIO = 0.05  # operational_status other than OPERATIONAL
 
 
 # --- Business rules ---------------------------------------------------------------------------
