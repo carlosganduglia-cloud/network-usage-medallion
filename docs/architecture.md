@@ -21,10 +21,10 @@ Governance metrics produced per rule, over a time window:
 |---|---|---|
 | 1 | Unused rules | Did any connection match this rule? |
 | 2 | Duplicate rules | Does another app/gateway have a rule granting the same IP(s), ports, protocol and group? |
-| 3 | User over-provisioning | Users granted (group size) vs distinct users actually connecting |
+| 3 | User over-provisioning | Active users granted (active users in group) vs distinct active users actually connecting |
 | 4 | Port over-provisioning | Ports granted (range width) vs distinct ports actually used |
 | 5 | IP over-provisioning | IPs granted (e.g. subnet size) vs distinct IPs actually hit |
-| 6 | Unstable resources | Does the rule's resource resolve to changing IP sets (more than *N* distinct sets in a rolling *D*-day window, configurable)? |
+| 6 | Unstable resources | Does the rule's resource resolve to changing IP sets (more than *N* distinct resolution states in a rolling *D*-day window, configurable)? |
 
 Results feed a dashboard (Databricks AI/BI).
 
@@ -32,24 +32,80 @@ Results feed a dashboard (Databricks AI/BI).
 
 ```mermaid
 erDiagram
-    APP ||--o{ VPN_RULE : owns
-    VPN_RULE }o--|| AD_GROUP : "grants to"
-    VPN_RULE }o--|| RESOURCE : "grants access to"
-    RESOURCE ||--o{ RESOURCE_RESOLUTION : "resolves to (over time)"
-    AD_GROUP ||--o{ AD_GROUP_MEMBER : has
-    USER ||--o{ AD_GROUP_MEMBER : "is"
-    USER ||--o{ TRAFFIC_LOG : "connects"
+    USER {
+        string sys_id PK "also the AD member_id (Option A)"
+        string email UK "silver lower/strips it"
+    }
+    TRAFFIC_LOG {
+        string event_id PK "dedup key in silver"
+        string user_email FK "joins users.email"
+    }
+    AD_GROUP {
+        string group_id PK
+        string name "unique only together with domain"
+        string domain
+    }
+    AD_GROUP_MEMBERSHIP {
+        string group_id FK "to ad_group.group_id"
+        string member_id FK "to users.sys_id"
+        string member_type "silver keeps user only"
+    }
+    VPN_RULE {
+        string sys_id PK
+        string app_sys_id FK "exactly one app per rule"
+        string ad_group_name FK "with ad_group_domain"
+        string ad_group_domain FK "with ad_group_name"
+        string resource FK "to resource_resolution.resource_name"
+    }
+    RESOURCE {
+        string name PK "vpn_rules.resource / resource_resolution.resource_name"
+    }
+    RESOURCE_RESOLUTION {
+        string resource_name FK
+        string state_id "state key; one state may span several rows"
+        long ip_start "one IP range per row"
+        long ip_end
+        timestamp first_seen "UTC, inclusive; per state"
+        timestamp last_seen "UTC, exclusive; per state; NULL = current"
+    }
+
+    APP ||--o{ VPN_RULE : "app_sys_id = sys_id"
+    USER ||--o{ TRAFFIC_LOG : "email = user_email"
+    USER ||--o{ AD_GROUP_MEMBERSHIP : "sys_id = member_id"
+    AD_GROUP ||--o{ AD_GROUP_MEMBERSHIP : "group_id"
+    VPN_RULE }o--|| AD_GROUP : "ad_group_name + domain = name + domain"
+    VPN_RULE }o--|| RESOURCE : "resource = resource_name"
+    RESOURCE ||--o{ RESOURCE_RESOLUTION : "resource_name = name"
 ```
 
 | Entity | Scale (synthetic) | Landing format | Notes |
 |---|---|---|---|
-| `users` | ~100k | JSON (API pages) | Some disabled |
-| `apps` | ~1–2k | JSON (API pages) | Independent rule namespaces (department/project) |
-| `vpn_rules` | ~120k | JSON (API pages) | App + gateway + resource + port spec (`"443"` or `"1-99"`) + protocol + group |
-| `ad_group` | ~500k | CSV | Group id, name, domain |
-| `ad_group_member` | ~20M | CSV | One row per membership; already flattened upstream (no nested groups); mostly `user` members |
-| `resource_resolutions` | ~1–2M (12 months of history) | Parquet | Resource → IP range (`ip_start`/`ip_end` as integers; single IP ⇒ start = end, subnet ⇒ first/last) with `first_seen`/`last_seen` |
+| `users` | ~100k | JSON Lines | Some disabled. `sys_id` doubles as the AD `member_id` (see join path). |
+| `apps` | ~1–2k | JSON Lines | Independent rule namespaces (department/project) |
+| `vpn_rules` | ~120k | JSON Lines | App + gateway + resource + port spec (`"443"` or `"1-99"`) + protocol + group. Group is referenced by **name + domain**, not by id. |
+| `ad_group` | ~500k | CSV | Group id, name, domain. `name` is only unique within `domain`. |
+| `ad_group_membership` | ~20M | CSV | One row per membership; already flattened upstream (no nested groups); `member_type` distinguishes `user` from other members. |
+| `resource_resolutions` | ~1–2M (12 months of history) | Parquet | One **state** = `(resource_name, state_id, first_seen, last_seen)`; a state may hold several IP ranges, one per row (`ip_start`/`ip_end` as **64-bit integers**; single IP ⇒ start = end, subnet ⇒ first/last). Timestamps are UTC and half-open. |
 | `traffic_logs` | **100M+** | CSV, daily batches | One event per connection: user email, destination IP, port, protocol, ALLOW/DENY. ~12 months |
+
+### Code fields
+
+Only one integer code affects the analysis:
+
+| Field | Code | Meaning | Used by |
+|---|---|---|---|
+| `vpn_rules.operational_status` | `1` | OPERATIONAL — the only active code | silver keeps these rules only |
+| | `0`, `3` | NON-OPERATIONAL, SUSPENDED | excluded from all analysis |
+| `users.status` | `1` | ACTIVE — the only active code | silver keeps these users only |
+| | `0`–`6` except `1` | inactive | excluded from all analysis |
+
+These are the codes the generator emits; the pipeline checks only `== 1` and treats **any** other
+value as inactive. `OPERATIONAL_STATUS_ACTIVE` and `USER_STATUS_ACTIVE` in `config.py` are the
+single sources of truth for the two fields, and each schema column carries the same note in its
+metadata comment. `DISABLED_USER_RATIO` controls how many users get inactive codes.
+
+An upstream `resource_type` code was deliberately left out: it is unreliable and no join or metric
+uses it.
 
 Key property of the problem: **logs don't say which rule allowed them.** A connection can be
 covered by several rules (different groups, or another app's rule on a large group), so every
@@ -58,6 +114,36 @@ rule that *could* have allowed it counts as used.
 **Upstream (out of scope):** the API sync service for users/apps/rules (full daily snapshots),
 the resource resolution service, and nested-group expansion. The pipeline starts from their
 exports in landing. See `docs/later.md`.
+
+### Matching join path
+
+These are the exact conditions the silver matching transform will implement. Each step is also a
+row in `JOIN_KEYS` in `tests/test_schemas.py`, so a renamed or retyped column fails fast.
+
+1. `traffic_logs.user_email` → `users.email` (silver lower/strips both) → take `users.sys_id`.
+   **Decision (Option A):** the API `sys_id` is the same identifier as the AD export's
+   `member_id`. No separate `ad_object_id` column exists; if the real export ever disagrees,
+   this is the decision to revisit.
+2. `users.sys_id` → `ad_group_membership.member_id`; keep `member_type = 'user'` and dedupe
+   `(group_id, member_id)`.
+3. `ad_group_membership.group_id` → `ad_group.group_id`. This hop is needed because rules name
+   groups rather than carrying their id.
+4. `vpn_rules.(ad_group_name, ad_group_domain)` → `ad_group.(name, domain)`. Composite: group
+   names are only unique within a domain.
+5. `vpn_rules.resource` → `resource_resolution.resource_name`, restricted to the state whose
+   interval contains the event: `first_seen <= event_time AND (last_seen IS NULL OR event_time < last_seen)`.
+   Intervals are **half-open** and disjoint **between states** (rows of one state share their
+   timestamps); a `NULL` `last_seen` means the state is current. Each event matches exactly one
+   state, but any range in that state may satisfy the IP predicate — so `rule_matches` is deduped
+   on `(event_id, rule_sys_id)`.
+6. `vpn_rules.app_sys_id` → `apps.sys_id`. Exactly one app per rule.
+
+A rule counts as used when an ALLOW event satisfies steps 1–5 plus the IP range, port range and
+protocol predicates. The *direction* of a join (which side is built/probed) is a performance
+decision; the conditions above are not.
+
+`ad_group_membership.group_domain` duplicates `ad_group.domain` by design because the upstream
+CSV is flat. Never join on it — go through `ad_group.group_id`.
 
 ## 4. Pipeline (medallion)
 
@@ -71,18 +157,37 @@ flowchart LR
     Gd --> D[Dashboard]
 ```
 
-- **Landing:** upstream exports in their natural formats — JSON API pages (users, apps, rules),
-  CSV (AD groups, memberships, traffic logs), Parquet (resolutions). Logs: one folder per day.
+- **Landing:** upstream exports in their natural formats — JSON Lines (users, apps, rules; one
+  object per line, no page envelope), CSV (AD groups, memberships, traffic logs), Parquet
+  (resolutions). Logs: one folder per day, continuing `LATE_EVENT_MAX_DAYS` past `END_DATE` so
+  late events near year-end still land. Generated event times carry an explicit `Z` and Parquet
+  timestamps are UTC-aware, so parsing does not depend on `spark.sql.session.timeZone`.
 - **Bronze:** append-only Delta, with `ingest_ts`, `source_file`, `batch_date`. Explicit schemas;
-  malformed records captured, not dropped silently.
+  malformed records captured, not dropped silently. `nullable=False` in a landing schema is
+  documentary only — file sources mark every column nullable, so required-value checks live in
+  silver or in Delta constraints. All readers attach `source_file` from `_metadata.file_path`
+  (CSV, JSON Lines and Parquet); unlike `input_file_name()`, it works on serverless compute and
+  survives a cache. CSV reads use `enforceSchema=False`, which validates the header against the
+  schema and fails on a mismatch — the default positional matching would silently shift a
+  reordered export into the wrong columns. CSV and JSON Lines readers add `_corrupt_record`:
+  rows with a wrong field count, malformed JSON, or a field with the wrong type keep their raw
+  text there. Parquet is schema-enforced, so it has no corrupt rows by design. Spark disallows
+  querying a raw file when only the corrupt column is needed; `corrupt_rows()` only filters, so
+  the caller caches locally for that workaround (serverless has no `cache()`). In production,
+  write the parsed DataFrame to bronze Delta and query corrupt rows there — Delta has no such
+  restriction.
 - **Silver:** normalize (email case/whitespace, IP string → integer, port spec → start/end,
-  user-only deduped memberships, latest snapshot of users/apps/rules, resolution validity from
-  `first_seen`/`last_seen`), keep ALLOW only, dedup, MERGE on `event_id`, partition by
-  `event_date`.
+  user-only deduped memberships, latest snapshot of users/apps/rules, resolution states from
+  `first_seen`/`last_seen`), keep only ALLOW events, active users (`USER_STATUS_ACTIVE`) and active
+  rules (`OPERATIONAL_STATUS_ACTIVE`), dedup, MERGE on `event_id`, partition by `event_date`.
 - **Matching:** each log ↔ every rule whose resolved IP range contains the destination IP
-  **at the event's time**, whose port range contains the port, same protocol, and whose group
-  contains the user. **TBD:** join strategy (naive range join vs binning) and measurements.
-- **Gold:** the six metrics; recomputed only for dates touched by a batch.
+  **at the event's instant**, whose port range contains the port, same protocol, and whose group
+  contains the user. Resolution validity is instant-granular with UTC half-open intervals
+  `[first_seen, last_seen)`; the full predicate is in §3 "Matching join path".
+  **TBD:** join strategy (naive range join vs binning) and measurements.
+- **Gold:** the six metrics; recomputed only for dates touched by a batch. Metric 3 counts active
+  users on both sides of the comparison. Metric 6 buckets resolution-state changes by UTC date
+  into windows `[d - UNSTABLE_WINDOW_DAYS + 1, d]`.
 
 **Runs:** a date-range parameter — one day for the daily run, a range for backfill. A
 `pipeline_runs` table records processed batches. **TBD:** Databricks Job definition.
@@ -103,7 +208,7 @@ flowchart LR
 - **Free Edition quotas:** large backfills run in date-range chunks; every stage supports a small
   (1M-event) fast path.
 - **Synthetic data only:** realistic shapes and deliberate data-quality issues (late and duplicate
-  events, unknown users, count mismatches, unused/duplicate/over-wide rules, unstable resources).
+  events, unknown users, malformed CSV rows, unused/duplicate/over-wide rules, unstable resources).
 
 ## 7. Design principles
 
@@ -114,10 +219,34 @@ flowchart LR
 
 ## 8. Testing
 
+- Schema contract tests (`tests/test_schemas.py`): join keys exist with matching types, IP columns
+  are `LongType`. No Spark session needed.
 - Unit tests per transform with tiny hand-built DataFrames (local SparkSession, `pytest`).
-- Generator validation: row counts, referential integrity, dirty-data ratios.
+- Generator validation: row counts, referential integrity, dirty-data ratios; normalized emails
+  stay unique; resolution states per resource are disjoint and ordered, rows of one state share
+  their timestamps, and no state has `last_seen <= first_seen`.
 - Pipeline checks: re-run idempotency, late-event placement. **TBD:** where these live.
 
 ## 9. Decisions
 
 Architecture Decision Records live in `docs/decisions/` (added as decisions are implemented).
+Until that directory exists, decisions are recorded inline here:
+
+- **Join keys (Option A):** `users.sys_id == ad_group_membership.member_id`. See §3.
+- **Group reference in rules:** `vpn_rules.(ad_group_name, ad_group_domain)` → `ad_group.(name, domain)`;
+  names are not globally unique. See §3.
+- **Landing schemas only in `schemas.py`:** silver schemas belong with their transforms and tests.
+- **Resolution validity:** UTC `TimestampType`, half-open `[first_seen, last_seen)`; `NULL`
+  `last_seen` means the state is current. Instant granularity lets a resource change IPs twice in
+  one day while each event still matches exactly one state. See §3 and §4.
+- **Code fields:** `resource_type` dropped as unused and unreliable; only code `1` is active for
+  both `operational_status` and `users.status`. See §3 "Code fields".
+- **Multi-range resolutions:** a state may hold several IP ranges; `state_id` identifies it,
+  disjointness is checked between states, and metric 6 counts states, not rows. See §3 and §4.
+- **Metric 3 denominator:** active users on both sides — granted and actually connecting. See §2.
+- **Late events:** landing batches extend to `LANDING_END_DATE = END_DATE + LATE_EVENT_MAX_DAYS`.
+- **Landing readers:** `io.py` owns strict CSV headers (`enforceSchema=False`), `_corrupt_record`
+  for CSV/JSON Lines, and `source_file` from `_metadata.file_path` for all formats; landing schemas
+  stay clean. See §4.
+- **Email uniqueness:** validated in the generator after lower/strip; silver dedup/quarantine is a
+  fallback if real data can collide. See §8.
