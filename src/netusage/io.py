@@ -1,14 +1,17 @@
 """File I/O for the pipeline.
 
 Transforms are pure: they take and return DataFrames. Every read of landing
-files (and later every Delta read/write) goes through this module.
+files and every Delta read/write goes through this module.
 """
 
+from datetime import date
 from pathlib import Path
 
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 from pyspark.sql.types import StringType, StructField, StructType
+
+from netusage import schemas
 
 CORRUPT_COLUMN = "_corrupt_record"
 SOURCE_COLUMN = "source_file"
@@ -91,6 +94,93 @@ def read_parquet(spark: SparkSession, path: str | Path, schema: StructType) -> D
     Parquet is schema-enforced, so there are no malformed rows to capture.
     """
     return _with_source_file(spark.read.schema(schema).parquet(str(path)))
+
+
+# Entities that arrive as full snapshots (every export holds the whole table), and the event
+# entity that arrives in daily batch folders.
+SNAPSHOT_ENTITIES = (
+    "users",
+    "apps",
+    "vpn_rules",
+    "ad_group",
+    "ad_group_membership",
+    "resource_resolution",
+)
+EVENT_ENTITY = "traffic_logs"
+
+_LANDING_READERS = {
+    "users": (read_json_lines, schemas.USERS),
+    "apps": (read_json_lines, schemas.APPS),
+    "vpn_rules": (read_json_lines, schemas.VPN_RULES),
+    "ad_group": (read_csv, schemas.AD_GROUP),
+    "ad_group_membership": (read_csv, schemas.AD_GROUP_MEMBERSHIP),
+    "resource_resolution": (read_parquet, schemas.RESOURCE_RESOLUTION),
+    "traffic_logs": (read_csv, schemas.TRAFFIC_LOGS),
+}
+
+
+def read_landing(spark: SparkSession, root: str | Path, entity: str) -> DataFrame:
+    """Read one landing entity with its format's reader and its landing schema.
+
+    For ``traffic_logs`` this reads the root folder, so partition discovery adds ``batch_date``
+    (a ``DateType`` column, parsed from the ``batch_date=YYYY-MM-DD`` folder names).
+    """
+    reader, schema = _LANDING_READERS[entity]
+    return reader(spark, landing_path(root, entity), schema)
+
+
+def read_traffic_batches(
+    spark: SparkSession, root: str | Path, start: date, end: date
+) -> DataFrame:
+    """Traffic log batches with ``start <= batch_date <= end``.
+
+    The filter is on the partition column, so Spark prunes folders outside the range before
+    reading a single file (partition pruning), and the remaining CSVs are still parsed in full.
+    """
+    return read_landing(spark, root, EVENT_ENTITY).where(
+        F.col(BATCH_COLUMN).between(F.lit(start), F.lit(end))
+    )
+
+
+# --- Delta tables --------------------------------------------------------------------------------
+# A "target" is either a Unity Catalog name (``netusage.bronze.users``, on Databricks) or a folder
+# path (``/…/data/bronze/users``, locally, where there is no catalog). Paths contain "/", table
+# names never do.
+
+
+def table_target(base: str | Path, name: str) -> str:
+    """Join a schema (``netusage.bronze``) or a folder (``/…/data/bronze``) with a table name."""
+    base = str(base)
+    return f"{base.rstrip('/')}/{name}" if "/" in base else f"{base}.{name}"
+
+
+def _is_path(target: str) -> bool:
+    return "/" in target
+
+
+def read_delta(spark: SparkSession, target: str) -> DataFrame:
+    if _is_path(target):
+        return spark.read.format("delta").load(target)
+    return spark.read.table(target)
+
+
+def replace_delta(df: DataFrame, target: str, condition: str) -> None:
+    """Atomically replace the rows matching ``condition`` with the rows of ``df``.
+
+    Delta's ``replaceWhere``: in one commit, remove every existing row matching ``condition`` and
+    add all of ``df``. Rows outside the condition are untouched, so re-running the same slice is
+    idempotent. Once the table exists, Delta also checks that every row of ``df`` matches
+    ``condition`` and fails the whole write otherwise (``DELTA_REPLACE_WHERE_MISMATCH``). The first
+    write creates the table and does *not* check, so callers must still filter ``df`` correctly.
+
+    Writes every column of ``df``: for a CSV landing read, that forces a full parse of each line,
+    which is what makes ``_corrupt_record`` reliable in bronze (see ``corrupt_rows``).
+    """
+    writer = df.write.format("delta").mode("overwrite").option("replaceWhere", condition)
+    if _is_path(target):
+        writer.save(target)
+    else:
+        writer.saveAsTable(target)
 
 
 def corrupt_rows(df: DataFrame) -> DataFrame:

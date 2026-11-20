@@ -5,8 +5,6 @@ checks per daily batch file, _corrupt_record capture, _metadata provenance, and 
 discovery of batch_date folders.
 """
 
-from datetime import date, timedelta
-
 import pytest
 from pyspark.sql import functions as F
 
@@ -14,19 +12,15 @@ from netusage import config as C
 from netusage import generator, io, schemas
 from netusage.validation import report, validate
 
-START = date(2025, 1, 1)
-END = START + timedelta(days=4)
+
+@pytest.fixture
+def landing(tiny_landing):
+    return tiny_landing.root
 
 
-@pytest.fixture(scope="module")
-def landing(spark, tmp_path_factory):
-    root = tmp_path_factory.mktemp("landing")
-    generator.generate(spark, C.TINY, root, START, END)
-    return root
-
-
-def test_generated_landing_passes_validation(spark, landing):
-    checks = validate(spark, landing, C.TINY, START, END)
+def test_generated_landing_passes_validation(spark, tiny_landing):
+    root, start, end = tiny_landing
+    checks = validate(spark, root, C.TINY, start, end)
     assert all(c.ok for c in checks), "\n" + report(checks)
 
 

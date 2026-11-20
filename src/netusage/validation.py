@@ -31,7 +31,7 @@ from pyspark.sql import DataFrame, SparkSession, Window
 from pyspark.sql import functions as F
 
 from netusage import config as C
-from netusage import io, schemas
+from netusage import io
 from netusage.config import ScaleProfile
 
 
@@ -70,25 +70,12 @@ def _norm_email(col: str) -> F.Column:
 
 
 def read_landing(spark: SparkSession, root: str | Path) -> dict[str, DataFrame]:
-    def p(entity: str) -> str:
-        return io.landing_path(root, entity)
-
-    return {
-        "users": io.read_json_lines(spark, p("users"), schemas.USERS),
-        "apps": io.read_json_lines(spark, p("apps"), schemas.APPS),
-        "vpn_rules": io.read_json_lines(spark, p("vpn_rules"), schemas.VPN_RULES),
-        "ad_group": io.read_csv(spark, p("ad_group"), schemas.AD_GROUP),
-        # cache(): see _full_parse.
-        "ad_group_membership": _full_parse(
-            io.read_csv(spark, p("ad_group_membership"), schemas.AD_GROUP_MEMBERSHIP)
-        ),
-        "resource_resolution": io.read_parquet(
-            spark, p("resource_resolution"), schemas.RESOURCE_RESOLUTION
-        ),
-        # Reading the root (not one batch folder) makes Spark discover batch_date=... folders and
-        # add batch_date as a column (partition discovery).
-        "traffic_logs": _full_parse(io.read_csv(spark, p("traffic_logs"), schemas.TRAFFIC_LOGS)),
-    }
+    d = {e: io.read_landing(spark, root, e) for e in (*io.SNAPSHOT_ENTITIES, io.EVENT_ENTITY)}
+    # Memberships and traffic get counted for malformed rows: parse them in full first.
+    # Traffic is read from its root, so partition discovery adds batch_date (see io.read_landing).
+    for entity in ("ad_group_membership", io.EVENT_ENTITY):
+        d[entity] = _full_parse(d[entity])
+    return d
 
 
 def _full_parse(df: DataFrame) -> DataFrame:
