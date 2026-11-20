@@ -162,8 +162,19 @@ flowchart LR
   (resolutions). Logs: one folder per day, continuing `LATE_EVENT_MAX_DAYS` past `END_DATE` so
   late events near year-end still land. Generated event times carry an explicit `Z` and Parquet
   timestamps are UTC-aware, so parsing does not depend on `spark.sql.session.timeZone`.
-- **Bronze:** append-only Delta, with `ingest_ts`, `source_file`, `batch_date`. Explicit schemas;
-  malformed records captured, not dropped silently. `nullable=False` in a landing schema is
+- **Bronze:** Delta tables (`netusage.bronze.<entity>`), landing columns plus `_corrupt_record`
+  (CSV/JSON Lines), `source_file`, `batch_date`, `ingest_ts`. Not partitioned (small daily
+  slices; Delta's per-file min/max stats skip files instead — compared in the optimization
+  notes). **Re-runs replace, never append:** each write is a Delta `replaceWhere` over its slice,
+  one atomic commit. Traffic logs: `batch_date` comes from the landing folder, and a run replaces
+  `start <= batch_date <= end` in one read and one write (daily run: `start = end`). Snapshot
+  entities: the current landing snapshot, stamped `batch_date = end` and replacing that date, so
+  bronze keeps one snapshot per run date and a backfill loads them once; silver takes the latest.
+  `bronze.ingest_audit` holds rows and `_corrupt_record` counts per entity and batch, counted from
+  the bronze tables after the write (writing parses every column, so CSV column pruning can't hide
+  malformed rows there) and replaced by the same slice. Code: `netusage.jobs.bronze`, called by
+  `notebooks/10_bronze_ingest.py` or locally `python -m netusage.jobs.bronze --start … --end …`.
+  Explicit schemas; malformed records captured, not dropped silently. `nullable=False` in a landing schema is
   documentary only — file sources mark every column nullable, so required-value checks live in
   silver or in Delta constraints. All readers attach `source_file` from `_metadata.file_path`
   (CSV, JSON Lines and Parquet); unlike `input_file_name()`, it works on serverless compute and
@@ -234,7 +245,12 @@ flowchart LR
 - Known gotcha, pinned by `tests/test_io.py`: with CSV column pruning (on by default), an
   aggregation over raw CSV files does not flag rows with an extra field in `_corrupt_record`.
   Count corrupt rows only after every column is parsed (cache locally, or in bronze).
-- Pipeline checks: re-run idempotency, late-event placement. **TBD:** where these live.
+- Bronze (`tests/test_bronze.py`): metadata transform and audit counts; `replaceWhere` replaces
+  only its slice and rejects rows outside it (only once the table exists — the first write does
+  not check); corrupt rows counted exactly from Delta with no cache; on TINY data, bronze matches
+  landing, a full re-run leaves every table and the audit unchanged, and a daily run replaces only
+  its day.
+- Pipeline checks: late-event placement. **TBD:** where these live.
 
 ## 9. Decisions
 
@@ -257,5 +273,8 @@ Until that directory exists, decisions are recorded inline here:
 - **Landing readers:** `io.py` owns strict CSV headers (`enforceSchema=False`), `_corrupt_record`
   for CSV/JSON Lines, and `source_file` from `_metadata.file_path` for all formats; landing schemas
   stay clean. See §4.
+- **Bronze re-runs:** Delta `replaceWhere` by `batch_date` slice instead of append; snapshot
+  entities stamped with the run's end date; bronze not partitioned; `ingest_audit` table for
+  per-batch row and corrupt counts. See §4.
 - **Email uniqueness:** validated in the generator after lower/strip; silver dedup/quarantine is a
   fallback if real data can collide. See §8.

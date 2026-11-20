@@ -122,4 +122,6 @@ UNSTABLE_WINDOW_DAYS = 3  # ...within this rolling window => resource is "Unstab
 CATALOG = "netusage"
 SCHEMAS = ("landing", "bronze", "silver", "gold")
 LANDING_VOLUME_PATH = f"/Volumes/{CATALOG}/landing/raw"
-LOCAL_LANDING_PATH = Path(__file__).resolve().parents[2] / "data" / "landing"
+LOCAL_DATA_PATH = Path(__file__).resolve().parents[2] / "data"
+LOCAL_LANDING_PATH = LOCAL_DATA_PATH / "landing"
+LOCAL_BRONZE_PATH = LOCAL_DATA_PATH / "bronze"  # one Delta folder per table (no catalog locally)
