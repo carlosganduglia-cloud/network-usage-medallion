@@ -162,6 +162,9 @@ flowchart LR
   (resolutions). Logs: one folder per day, continuing `LATE_EVENT_MAX_DAYS` past `END_DATE` so
   late events near year-end still land. Generated event times carry an explicit `Z` and Parquet
   timestamps are UTC-aware, so parsing does not depend on `spark.sql.session.timeZone`.
+  Generated locally (`python -m netusage.generator`) or on Databricks straight into the landing
+  Volume (`notebooks/05_generate_landing.py`). Randomness is hash-based, so both produce the same
+  rows: on SMALL, `validation.py` reports identical counts in both environments.
 - **Bronze:** Delta tables (`netusage.bronze.<entity>`), landing columns plus `_corrupt_record`
   (CSV/JSON Lines), `source_file`, `batch_date`, `ingest_ts`. Not partitioned (small daily
   slices; Delta's per-file min/max stats skip files instead — compared in the optimization
@@ -187,6 +190,14 @@ flowchart LR
   the caller caches locally for that workaround (serverless has no `cache()`). In production,
   write the parsed DataFrame to bronze Delta and query corrupt rows there — Delta has no such
   restriction.
+  **On Databricks** (SMALL, first run): the backfill's audit totals equal the local run and
+  `validation.py` for every entity (e.g. traffic 1,004,969 rows / 476 corrupt). A one-day re-run
+  leaves the totals unchanged. Unity Catalog managed tables enable **deletion vectors**, so that
+  re-run marked the day's 2,823 old rows deleted in place and added one ~50 KB file, with no file
+  removed. Locally, without deletion vectors, it rewrites the whole multi-day file holding the
+  day. `operationMetrics` reports the logical rewrite (`numCopiedRows`) in both cases; check
+  `DESCRIBE DETAIL` (file count, size) for what was physically written. Deleted rows are still
+  scanned until `OPTIMIZE` purges them.
 - **Silver:** normalize (email case/whitespace, IP string → integer, port spec → start/end,
   user-only deduped memberships, latest snapshot of users/apps/rules, resolution states from
   `first_seen`/`last_seen`), keep only ALLOW events, active users (`USER_STATUS_ACTIVE`) and active
