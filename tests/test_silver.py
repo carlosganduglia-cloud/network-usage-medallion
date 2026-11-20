@@ -1,189 +1,79 @@
-from pyspark.sql import Row
+"""Tiny unit tests for normalize_ports."""
 
-from netusage.transforms.silver import normalize_port
+from netusage.transforms.silver import normalize_ports
 
 
-def test_single_port(spark):
-    """A single port should produce identical start and end values."""
+def _normalize(spark, ports):
+    """Build a one-column DataFrame from raw port strings and normalize it."""
+    return normalize_ports(spark.createDataFrame([(p,) for p in ports], "port string"))
 
-    df = spark.createDataFrame([("49",), ("80",), ("443",)], ["port"])
 
-    result = normalize_port(df)
+def _as_dict(df):
+    """Collect as {raw_port: (start, end, flag)} so row order never matters."""
+    return {
+        r.port: (r.port_start, r.port_end, r.port_spec_valid)
+        for r in df.select("port", "port_start", "port_end", "port_spec_valid").collect()
+    }
 
-    expected = [
-        Row(port_start=49, port_end=49),
-        Row(port_start=80, port_end=80),
-        Row(port_start=443, port_end=443),
+
+def test_valid_single_port_and_range(spark):
+    result = _as_dict(_normalize(spark, ["99", "1-9"]))
+
+    assert result == {
+        "99": (99, 99, True),
+        "1-9": (1, 9, True),
+    }
+
+
+def test_invalid_values_do_not_throw_and_are_flagged(spark):
+    # "99999999999" overflows try_cast; the flag must be False, not NULL.
+    ports = [
+        # malformed
+        "abc",
+        "80-abc",
+        "-20",
+        "80-",
+        "1-2-3",
+        "",
+        "   ",
+        None,
+        # out of range (port 0 is reserved)
+        "0",
+        "0-65535",
+        "65536",
+        "1-65536",
+        "65536-65536",
+        # start > end
+        "100-1",
+        # overflow try_cast to NULL
+        "99999999999",
+        "1-99999999999",
+        "99999999999-1",
     ]
+    result = _as_dict(_normalize(spark, ports))
 
-    assert result.collect() == expected
-
-
-def test_port_range(spark):
-    """A port range should produce the correct start and end values."""
-
-    df = spark.createDataFrame([("1-20",), ("100-200",), ("500-1000",)], ["port"])
-
-    result = normalize_port(df)
-
-    expected = [
-        Row(port_start=1, port_end=20),
-        Row(port_start=100, port_end=200),
-        Row(port_start=500, port_end=1000),
-    ]
-
-    assert result.collect() == expected
+    assert result == {port: (None, None, False) for port in ports}
 
 
-def test_boundary_ports(spark):
-    """Port values at the valid boundaries (1 and 65535) should be accepted."""
+def test_surrounding_whitespace_is_trimmed(spark):
+    result = _as_dict(_normalize(spark, ["  1-9  "]))
 
-    df = spark.createDataFrame([("1",), ("65535",), ("1-65535",)], ["port"])
-
-    result = normalize_port(df)
-
-    expected = [
-        Row(port_start=1, port_end=1),
-        Row(port_start=65535, port_end=65535),
-        Row(port_start=1, port_end=65535),
-    ]
-
-    assert result.collect() == expected
+    assert result == {"  1-9  ": (1, 9, True)}
 
 
-def test_padded_ports_are_trimmed(spark):
-    """Whitespace-padded ports should be trimmed and accepted."""
+def test_boundaries_are_inclusive(spark):
+    result = _as_dict(_normalize(spark, ["1", "65535", "1-65535"]))
 
-    df = spark.createDataFrame([(" 443 ",), (" 1-20 ",)], ["port"])
-
-    result = normalize_port(df)
-
-    expected = [
-        Row(port_start=443, port_end=443),
-        Row(port_start=1, port_end=20),
-    ]
-
-    assert result.collect() == expected
+    assert result == {
+        "1": (1, 1, True),
+        "65535": (65535, 65535, True),
+        "1-65535": (1, 65535, True),
+    }
 
 
-def test_invalid_port_values_are_filtered(spark):
-    """Malformed port values should be filtered out."""
+def test_output_columns_are_integers_and_raw_port_is_kept(spark):
+    schema = _normalize(spark, ["1-20"]).schema
 
-    df = spark.createDataFrame(
-        [
-            ("abc",),
-            ("80-abc",),
-            ("-20",),
-            ("80-",),
-            ("80-90-100",),
-            ("",),
-            ("   ",),
-        ],
-        ["port"],
-    )
-
-    result = normalize_port(df)
-
-    assert result.count() == 0
-
-
-def test_integer_overflow_values_are_filtered(spark):
-    """Values that overflow INT should be filtered, not crash the cast (ANSI mode)."""
-
-    df = spark.createDataFrame(
-        [
-            ("99999999999",),
-            ("1-99999999999",),
-            ("99999999999-1",),
-        ],
-        ["port"],
-    )
-
-    result = normalize_port(df)
-
-    assert result.count() == 0
-
-
-def test_out_of_range_ports_are_filtered(spark):
-    """Ports outside 1-65535 should be filtered out (port 0 is reserved)."""
-
-    df = spark.createDataFrame(
-        [
-            ("0",),
-            ("0-65535",),
-            ("-1",),
-            ("65536",),
-            ("1-65536",),
-            ("65536-65536",),
-        ],
-        ["port"],
-    )
-
-    result = normalize_port(df)
-
-    assert result.count() == 0
-
-
-def test_invalid_range_order_is_filtered(spark):
-    """A range where start is greater than end should be filtered."""
-
-    df = spark.createDataFrame(
-        [
-            ("20-10",),
-            ("100-50",),
-        ],
-        ["port"],
-    )
-
-    result = normalize_port(df)
-
-    assert result.count() == 0
-
-
-def test_mixed_valid_and_invalid_ports(spark):
-    """Only valid rows should remain after normalization."""
-
-    df = spark.createDataFrame(
-        [
-            ("49",),
-            ("1-20",),
-            ("invalid",),
-            ("65536",),
-            ("100-200",),
-            ("99999999999",),
-        ],
-        ["port"],
-    )
-
-    result = normalize_port(df)
-
-    expected = [
-        Row(port_start=49, port_end=49),
-        Row(port_start=1, port_end=20),
-        Row(port_start=100, port_end=200),
-    ]
-
-    assert result.collect() == expected
-
-
-def test_original_port_column_is_removed(spark):
-    """The original port column should not exist in the output."""
-
-    df = spark.createDataFrame([("49",)], ["port"])
-
-    result = normalize_port(df)
-
-    assert "port" not in result.columns
-    assert "port_start" in result.columns
-    assert "port_end" in result.columns
-
-
-def test_output_columns_are_integers(spark):
-    """Normalized columns should have IntegerType."""
-
-    df = spark.createDataFrame([("1-20",)], ["port"])
-
-    result = normalize_port(df)
-
-    assert result.schema["port_start"].dataType.simpleString() == "int"
-    assert result.schema["port_end"].dataType.simpleString() == "int"
+    assert schema["port"].dataType.simpleString() == "string"
+    assert schema["port_start"].dataType.simpleString() == "int"
+    assert schema["port_end"].dataType.simpleString() == "int"
