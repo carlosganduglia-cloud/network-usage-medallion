@@ -59,29 +59,28 @@ def ip_to_long(ip: Column | str) -> Column:
     - Leading zeros ("010.0.0.1") are rejected: canonical dotted-decimal has none, they are
       ambiguous with octal, and the generator never writes them.
     - Anything invalid (wrong shape, octet > 255, digits overflowing a long) returns null
-      instead of raising: try_cast returns null on failure and the null comparisons reject the
-      row even under ANSI mode. Returning null (rather than filtering) keeps this composable
-      with the other silver expressions in one select, and leaves the quarantine decision to
-      the caller.
+      instead of raising: try_cast and F.get return null on failure (cast overflow, missing
+      array index), and the null comparisons reject the row even under ANSI mode. Returning
+      null (rather than filtering) keeps this composable with the other silver expressions in
+      one select, and leaves the quarantine decision to the caller.
 
     Unlike normalize_port, this is not tied to a column name.
     """
     ip = F.col(ip) if isinstance(ip, str) else ip
     trimmed = F.trim(ip)
+    # F.get (not getItem): under ANSI mode, getItem throws INVALID_ARRAY_INDEX on a missing
+    # index — inputs like "" or "10.0.0" split into fewer than 4 parts — and Spark may hoist it
+    # out of the AND chain via common subexpression elimination, so a guard beside it is not
+    # enough (the port function only survives getItem because it sits inside F.when's branch).
+    # F.get returns null instead. Rule of thumb under ANSI: anything that can throw (cast,
+    # getItem, element_at, division, ...) needs its try_/null-safe version.
     parts = F.split(trimmed, r"\.")
-    octets = [parts.getItem(i).try_cast("long") for i in range(4)]
+    octets = [F.get(parts, i).try_cast("long") for i in range(4)]
 
-    is_valid_ip = (
-        trimmed.rlike(_IP_REGEX)
-        & (octets[0] >= 0)
-        & (octets[0] <= 255)
-        & (octets[1] >= 0)
-        & (octets[1] <= 255)
-        & (octets[2] >= 0)
-        & (octets[2] <= 255)
-        & (octets[3] >= 0)
-        & (octets[3] <= 255)
-    )
+    # The regex only allows digits, so octets can never be negative; only the 255 cap matters.
+    is_valid_ip = trimmed.rlike(_IP_REGEX)
+    for octet in octets:
+        is_valid_ip &= octet <= 255
     value = (
         octets[0] * F.lit(256**3) + octets[1] * F.lit(256**2) + octets[2] * F.lit(256) + octets[3]
     )

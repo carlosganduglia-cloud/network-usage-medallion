@@ -248,6 +248,8 @@ def test_ip_to_long_invalid_returns_null(spark):
         [
             ("256.0.0.1",),
             ("10.0.0",),
+            ("10.0.0.",),
+            ("10..0.1",),
             ("10.0.0.1.5",),
             ("a.b.c.d",),
             ("",),
@@ -260,7 +262,7 @@ def test_ip_to_long_invalid_returns_null(spark):
 
     result = df.select(ip_to_long("destination_ip").alias("ip_long"))
 
-    assert result.collect() == [Row(ip_long=None) for _ in range(8)]
+    assert result.collect() == [Row(ip_long=None) for _ in range(10)]
 
 
 def test_ip_to_long_rejects_leading_zeros(spark):
