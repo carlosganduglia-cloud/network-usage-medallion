@@ -76,3 +76,22 @@ display(
         LIMIT 50
     """)
 )
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC Totals per entity across all batches in the audit. Compare these with the generator's
+# MAGIC validation report for the same profile (`python -m netusage.validation`), e.g. SMALL:
+# MAGIC traffic_logs 1,004,969 rows / 476 corrupt, ad_group_membership 2,031,725 / 1,007.
+# MAGIC Snapshot entities show one batch per run date that loaded snapshots.
+
+# COMMAND ----------
+
+display(
+    spark.sql(f"""
+        SELECT entity, COUNT(*) AS batches, SUM(rows) AS rows, SUM(corrupt_rows) AS corrupt_rows
+        FROM {BRONZE}.ingest_audit
+        GROUP BY entity
+        ORDER BY entity
+    """)
+)
