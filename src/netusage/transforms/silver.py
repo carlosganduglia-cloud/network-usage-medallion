@@ -2,6 +2,10 @@
 
 Bad values are flagged in an output column, not dropped here; callers decide
 whether to quarantine them or let downstream filters exclude them.
+
+The table transforms (e.g. ``traffic_events``) do remove rows, but only for business
+filters (ALLOW events only, active users and rules) and deduplication, never because a
+value failed to parse.
 """
 
 from pyspark.sql import Column, DataFrame, Window

@@ -1,4 +1,4 @@
-"""Tiny unit tests for normalize_ports."""
+"""Unit tests for the silver transforms, on tiny hand-built DataFrames (plus a few on TINY data)."""
 
 from datetime import UTC, date, datetime
 
