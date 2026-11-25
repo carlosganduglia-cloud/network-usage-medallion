@@ -1,40 +1,45 @@
-from pyspark.sql import Column, DataFrame
+"""Silver transforms: pure functions that normalize bronze columns.
+
+Bad values are flagged in an output column, not dropped here; callers decide
+whether to quarantine them or let downstream filters exclude them.
+"""
+
+from pyspark.sql import DataFrame, Column
 from pyspark.sql import functions as F
 
+PORT_SPEC = r"^[0-9]+(?:-[0-9]+)?\z"
 
-def normalize_port(df: DataFrame) -> DataFrame:
-    """
-    Normalize the port field into port_start and port_end.
 
-    Supported formats (surrounding whitespace is trimmed):
-        - "49"    -> port_start=49, port_end=49
-        - "1-20"  -> port_start=1, port_end=20
+def normalize_ports(df: DataFrame) -> DataFrame:
+    """Normalize a raw ``port`` string into integer start/end columns.
 
-    Valid ports are 1-65535 (port 0 is reserved in TCP/UDP and rejected).
-    Rows with anything else are dropped. Values are try_cast rather than
-    cast so out-of-INT-range input (e.g. "99999999999") yields null and
-    gets filtered instead of raising CAST_INVALID_INPUT under ANSI mode
-    (Spark 4 default).
+    Valid formats are ``N`` and ``N-M`` with 1 <= N <= M <= 65535. The original
+    ``port`` column is preserved. Invalid rows get null start/end values and
+    ``port_spec_valid = false``; they are flagged, not dropped. ``coalesce``
+    keeps the flag strictly boolean when an all-digit value overflows
+    ``try_cast("int")`` to null.
     """
     port = F.trim(F.col("port"))
-    ports = F.split(port, "-")
-    start = ports.getItem(0).try_cast("int")
-    end = F.when(port.contains("-"), ports.getItem(1).try_cast("int")).otherwise(start)
+    parts = F.split(port, "-")
+    start = F.get(parts, 0).try_cast("int")
+    # Branch on structure, not on a NULL: try_cast also returns NULL when the second part exists
+    # but overflows, and coalesce(end, start) would turn "1-99999999999" into the valid port 1.
+    end = F.when(F.size(parts) > 1, F.get(parts, 1).try_cast("int")).otherwise(start)
 
-    is_valid_port = (
-        port.rlike(r"^\d+(-\d+)?$")
-        & (start >= 1)
-        & (start <= 65535)
-        & (end >= 1)
-        & (end <= 65535)
-        & (start <= end)
+    port_spec_valid = F.coalesce(
+        (
+            F.col("port").isNotNull()
+            & port.rlike(PORT_SPEC)
+            & start.between(1, 65535)
+            & end.between(1, 65535)
+            & (start <= end)
+        ),
+        F.lit(False),
     )
-
     return (
-        df.filter(is_valid_port)
-        .withColumn("port_start", start)
-        .withColumn("port_end", end)
-        .drop("port")
+        df.withColumn("port_start", F.when(port_spec_valid, start))
+        .withColumn("port_end", F.when(port_spec_valid, end))
+        .withColumn("port_spec_valid", port_spec_valid)
     )
 
 
