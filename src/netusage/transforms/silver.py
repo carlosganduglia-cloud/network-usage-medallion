@@ -178,6 +178,27 @@ def normalize_protocol(protocol: Column | str) -> Column:
     return F.nullif(F.upper(F.trim(_as_col(protocol))), F.lit(""))
 
 
+def latest_snapshot(bronze: DataFrame) -> DataFrame:
+    """Keep only the rows of the newest ``batch_date`` in a bronze snapshot table.
+
+    Bronze keeps one full snapshot of users, apps, rules, groups, memberships and resolutions
+    per run date; silver uses the latest one. The input's columns come back unchanged.
+
+    How: compute the max ``batch_date`` as a 1-row DataFrame and semi-join on it. Everything
+    stays in one lazy plan (no ``collect()`` to the driver), and broadcasting the 1-row side
+    avoids moving all rows to one partition, as a ``Window`` without ``partitionBy`` would.
+    ``left_semi`` keeps the left rows that have a match and adds no columns from the right.
+    Rows with a null ``batch_date`` never match (``max`` ignores nulls and ``=`` with null is
+    not true); bronze always sets it.
+
+    The final ``select`` restores the input's column order: a join ``on`` a column name puts
+    that column first, even for ``left_semi``.
+    """
+    newest = bronze.agg(F.max(BATCH_COLUMN).alias(BATCH_COLUMN))
+    latest = bronze.join(F.broadcast(newest), on=BATCH_COLUMN, how="left_semi")
+    return latest.select(*bronze.columns)
+
+
 def traffic_events(bronze: DataFrame) -> DataFrame:
     """Build silver traffic events from a slice of bronze ``traffic_logs``.
 

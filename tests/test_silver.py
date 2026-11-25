@@ -8,6 +8,7 @@ from pyspark.sql import functions as F
 from netusage import io
 from netusage.transforms.silver import (
     ip_to_long,
+    latest_snapshot,
     normalize_email,
     normalize_ports,
     normalize_protocol,
@@ -688,3 +689,44 @@ def test_traffic_events_does_not_collapse_null_event_ids(spark):
     result = _events(spark, _bronze_event(None), _bronze_event(None), _bronze_event("x"))
 
     assert result.count() == 3
+
+
+# --- latest_snapshot -----------------------------------------------------------------------------
+
+SNAPSHOT = "sys_id string, name string, batch_date date"
+
+
+def test_latest_snapshot_keeps_only_newest_batch(spark):
+    df = spark.createDataFrame(
+        [
+            ("a", "old", date(2025, 1, 1)),
+            ("a", "new", date(2025, 1, 3)),
+            ("b", "new", date(2025, 1, 3)),
+            ("c", "mid", date(2025, 1, 2)),  # gone from the newest snapshot: dropped
+        ],
+        SNAPSHOT,
+    )
+
+    result = sorted(tuple(r) for r in latest_snapshot(df).collect())
+
+    assert result == [("a", "new", date(2025, 1, 3)), ("b", "new", date(2025, 1, 3))]
+
+
+def test_latest_snapshot_single_snapshot_is_unchanged(spark):
+    df = spark.createDataFrame(
+        [("a", "x", date(2025, 1, 1)), ("b", "y", date(2025, 1, 1))], SNAPSHOT
+    )
+
+    assert sorted(latest_snapshot(df).collect()) == sorted(df.collect())
+
+
+def test_latest_snapshot_keeps_columns_and_types(spark):
+    df = spark.createDataFrame([("a", "x", date(2025, 1, 1))], SNAPSHOT)
+
+    assert latest_snapshot(df).schema == df.schema
+
+
+def test_latest_snapshot_empty_input_gives_empty_output(spark):
+    df = spark.createDataFrame([], SNAPSHOT)
+
+    assert latest_snapshot(df).count() == 0
