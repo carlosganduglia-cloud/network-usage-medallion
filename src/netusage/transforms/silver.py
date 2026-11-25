@@ -4,8 +4,11 @@ Bad values are flagged in an output column, not dropped here; callers decide
 whether to quarantine them or let downstream filters exclude them.
 """
 
-from pyspark.sql import Column, DataFrame
+from pyspark.sql import Column, DataFrame, Window
 from pyspark.sql import functions as F
+
+from netusage import config as C
+from netusage.io import BATCH_COLUMN, CORRUPT_COLUMN, SOURCE_COLUMN
 
 PORT_SPEC = r"^[0-9]+(?:-[0-9]+)?\z"
 
@@ -169,3 +172,56 @@ def normalize_protocol(protocol: Column | str) -> Column:
     simply matches no rule in the join, which is a business outcome, not a parse failure.
     """
     return F.nullif(F.upper(F.trim(_as_col(protocol))), F.lit(""))
+
+
+def traffic_events(bronze: DataFrame) -> DataFrame:
+    """Build silver traffic events from a slice of bronze ``traffic_logs``.
+
+    Steps, in order:
+    1. Keep ALLOW events only (a business filter, not a validity check).
+    2. One ``select``: keep every bronze column and add the parsed ones next to their source
+       (invalid values become null; the raw string stays so they can be diagnosed).
+    3. Flag rows Spark could not parse: ``is_corrupt``. They are kept, not dropped.
+    4. Remove duplicate ``event_id`` within this slice, keeping one copy deterministically.
+       Duplicates against events already in silver are the MERGE's job, not this function's.
+    """
+    allowed = bronze.where(F.col("action") == C.ACTION_ALLOW)
+
+    # The parsed value takes the plain name, so the obvious column is the safe one to join on;
+    # the bronze value is kept as <name>_raw for diagnosing nulls.
+    event_ts = parse_event_time("event_time")
+    parsed = allowed.select(
+        "event_id",
+        F.col("event_time").alias("event_time_raw"),
+        event_ts.alias("event_ts"),
+        utc_date(event_ts).alias("event_date"),
+        F.col("user_email").alias("user_email_raw"),
+        normalize_email("user_email").alias("user_email"),
+        F.col("destination_ip").alias("destination_ip_raw"),
+        ip_to_long("destination_ip").alias("destination_ip"),
+        F.col("destination_port").alias("destination_port_raw"),
+        port_to_int("destination_port").alias("destination_port"),
+        F.col("protocol").alias("protocol_raw"),
+        normalize_protocol("protocol").alias("protocol"),
+        "action",
+        CORRUPT_COLUMN,
+        F.col(CORRUPT_COLUMN).isNotNull().alias("is_corrupt"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+    # Which copy survives must not depend on how Spark happens to order the rows, or re-running
+    # the same slice could store a different copy (a different source_file). So rank explicitly:
+    # a clean copy beats a corrupt one, then the earliest batch, then the file name as tie-break.
+    # source_file sorts byte by byte ("part-10" < "part-9"): stable, not meaningful, and that is
+    # all a tie-break needs. Known gap: two copies in the SAME file tie on every key, so Spark may
+    # keep either one. Harmless here (the generator writes one file per batch and its copies are
+    # identical); real data would need a per-row key. Parked in docs/later.md.
+    first_copy = Window.partitionBy("event_id").orderBy(
+        F.col("is_corrupt").asc(), F.col(BATCH_COLUMN).asc(), F.col(SOURCE_COLUMN).asc()
+    )
+    ranked = parsed.withColumn("_copy", F.row_number().over(first_copy))
+    # partitionBy puts every null event_id in ONE group; without the isNull branch, all rows
+    # missing an id would collapse into a single row. Keep them all: they are not duplicates.
+    return ranked.where((F.col("_copy") == 1) | F.col("event_id").isNull()).drop("_copy")

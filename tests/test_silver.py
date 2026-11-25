@@ -13,6 +13,7 @@ from netusage.transforms.silver import (
     normalize_protocol,
     parse_event_time,
     port_to_int,
+    traffic_events,
     utc_date,
 )
 
@@ -555,3 +556,135 @@ def test_traffic_log_columns_parse_on_generated_data(spark, tiny_landing):
     assert on_time.count() > 0
     assert parsed.where(utc_date(F.col("ts")) > F.col(io.BATCH_COLUMN)).count() == 0
     events.unpersist()
+
+
+# --- traffic_events ------------------------------------------------------------------------------
+
+BRONZE_TRAFFIC = (
+    "event_id string, event_time string, user_email string, destination_ip string, "
+    "destination_port string, protocol string, action string, _corrupt_record string, "
+    "source_file string, batch_date date, ingest_ts timestamp"
+)
+INGEST_TS = datetime(2025, 1, 10, tzinfo=UTC)
+
+
+def _bronze_event(
+    event_id="evt1",
+    action="ALLOW",
+    batch_date=date(2025, 1, 1),
+    corrupt=None,
+    event_time="2025-01-01T03:00:00Z",
+    port="443",
+):
+    """One bronze traffic row with valid defaults; override only what a test is about."""
+    source = f"traffic_logs/batch_date={batch_date}/part-0.csv"
+    return (
+        event_id,
+        event_time,
+        " Alice@Corp.Example ",
+        "10.0.0.1",
+        port,
+        "tcp",
+        action,
+        corrupt,
+        source,
+        batch_date,
+        INGEST_TS,
+    )
+
+
+def _events(spark, *rows):
+    return traffic_events(spark.createDataFrame(list(rows), BRONZE_TRAFFIC))
+
+
+def test_traffic_events_parsed_take_plain_names_raw_kept(spark):
+    row = _events(spark, _bronze_event()).first()
+
+    # Parsed values take the plain names...
+    assert row.event_date == date(2025, 1, 1)
+    assert row.user_email == "alice@corp.example"
+    assert row.destination_ip == 167772161
+    assert row.destination_port == 443
+    assert row.protocol == "TCP"
+    # ...and the bronze values are kept unchanged as *_raw.
+    assert row.event_time_raw == "2025-01-01T03:00:00Z"
+    assert row.user_email_raw == " Alice@Corp.Example "
+    assert row.destination_ip_raw == "10.0.0.1"
+    assert row.destination_port_raw == "443"
+    assert row.protocol_raw == "tcp"
+    assert row.is_corrupt is False
+
+
+def test_traffic_events_schema(spark):
+    types = dict(_events(spark, _bronze_event()).dtypes)
+
+    assert types["event_ts"] == "timestamp"
+    assert types["event_date"] == "date"
+    assert types["user_email"] == "string"
+    assert types["destination_ip"] == "bigint"
+    assert types["destination_port"] == "int"
+    assert types["destination_ip_raw"] == "string"
+    assert types["destination_port_raw"] == "string"
+    assert types["is_corrupt"] == "boolean"
+    assert "_copy" not in types  # the dedup helper column does not leak
+
+
+def test_traffic_events_keeps_allow_only(spark):
+    result = _events(
+        spark,
+        _bronze_event("a", action="ALLOW"),
+        _bronze_event("d", action="DENY"),
+        _bronze_event("n", action=None),
+    )
+
+    assert [r.event_id for r in result.collect()] == ["a"]
+
+
+def test_traffic_events_flags_corrupt_rows_without_dropping_them(spark):
+    result = _events(
+        spark,
+        _bronze_event("ok"),
+        _bronze_event("bad", corrupt="evt,...,ALLOW,EXTRA"),
+    )
+
+    assert {r.event_id: r.is_corrupt for r in result.collect()} == {"ok": False, "bad": True}
+
+
+def test_traffic_events_bad_values_become_null_not_errors(spark):
+    """ANSI breakers in every parsed column: the row survives with nulls, the job does not fail."""
+    row = _events(spark, _bronze_event(event_time="garbage", port="")).first()
+
+    assert row.event_ts is None
+    assert row.event_date is None
+    assert row.destination_port is None
+    assert row.destination_port_raw == ""
+
+
+def test_traffic_events_dedup_keeps_earliest_batch(spark):
+    result = _events(
+        spark,
+        _bronze_event("dup", batch_date=date(2025, 1, 2)),
+        _bronze_event("dup", batch_date=date(2025, 1, 1)),
+        _bronze_event("other"),
+    )
+
+    rows = {r.event_id: r.batch_date for r in result.collect()}
+    assert rows == {"dup": date(2025, 1, 1), "other": date(2025, 1, 1)}
+
+
+def test_traffic_events_dedup_prefers_clean_copy_over_earlier_corrupt_one(spark):
+    result = _events(
+        spark,
+        _bronze_event("dup", batch_date=date(2025, 1, 1), corrupt="raw text"),
+        _bronze_event("dup", batch_date=date(2025, 1, 2)),
+    )
+
+    row = result.first()
+    assert result.count() == 1
+    assert (row.batch_date, row.is_corrupt) == (date(2025, 1, 2), False)
+
+
+def test_traffic_events_does_not_collapse_null_event_ids(spark):
+    result = _events(spark, _bronze_event(None), _bronze_event(None), _bronze_event("x"))
+
+    assert result.count() == 3
