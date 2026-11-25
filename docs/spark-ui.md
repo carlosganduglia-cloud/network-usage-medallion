@@ -47,20 +47,22 @@ Use `--profile small` (1M events, about a minute) when you want stages with real
    from netusage.session import local_spark
 
    spark = local_spark("explore")
-   print(spark.sparkContext.uiWebUrl)        # usually http://...:4040
+   print(spark.sparkContext.uiWebUrl)  # usually http://...:4040
 
    logs = io.read_landing(spark, C.LOCAL_LANDING_PATH, io.EVENT_ENTITY)
 
-   spark.sparkContext.setJobDescription("count traffic logs")   # names the job in the UI
+   spark.sparkContext.setJobDescription("count traffic logs")  # names the job in the UI
    logs.count()
 
    spark.sparkContext.setJobDescription("users per batch_date")
-   (logs.groupBy("batch_date")
-        .agg(F.count("*").alias("n"), F.countDistinct("user_email").alias("users"))
-        .orderBy("batch_date")
-        .show())
+   (
+       logs.groupBy("batch_date")
+       .agg(F.count("*").alias("n"), F.countDistinct("user_email").alias("users"))
+       .orderBy("batch_date")
+       .show()
+   )
 
-   logs.groupBy("batch_date").count().explain("formatted")       # plan in the terminal too
+   logs.groupBy("batch_date").count().explain("formatted")  # plan in the terminal too
    ```
 
    Bronze Delta tables (after the bronze job):

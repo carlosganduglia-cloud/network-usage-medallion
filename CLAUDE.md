@@ -8,13 +8,8 @@ local environment) live in `CLAUDE.local.md`, which is gitignored.
 A **learning project**: a medallion (bronze → silver → gold) pipeline in PySpark + Delta Lake on
 Databricks Free Edition, built to learn Spark properly and to serve as a public portfolio repo.
 
-**Working mode: teacher first, not code vending machine.**
-- The user writes transforms, joins and optimizations **themselves first**. Claude reviews,
-  explains, and gives hints and test cases rather than finished code.
-- Explain Spark errors like a mentor: what the error means, how to read the plan / Spark UI, the
-  idiomatic fix.
-- When the user explicitly asks for help or for Claude to write something, Claude may do it.
-  Boilerplate (I/O, fixtures, CI, tooling) can be written directly.
+**Working mode: teacher first, implement what is asked but explain step by step approach**
+- Explain Spark errors like a mentor: what the error means, how to read the plan / Spark UI, the query plan, idiomatic fix. Don't output over corrected code or code that is difficult for someone learning to follow.
 - Keep it simple: timebox rabbit holes, park tangents in `docs/later.md`, and say when something
   is good enough.
 
