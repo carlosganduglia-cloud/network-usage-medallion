@@ -1,10 +1,35 @@
 """Tiny unit tests for normalize_ports."""
 
+from datetime import UTC, date, datetime
+
 from pyspark.sql import Row
 from pyspark.sql import functions as F
 
 from netusage import io
-from netusage.transforms.silver import normalize_ports, ip_to_long
+from netusage.transforms.silver import (
+    ip_to_long,
+    normalize_email,
+    normalize_ports,
+    normalize_protocol,
+    parse_event_time,
+    port_to_int,
+    traffic_events,
+    utc_date,
+)
+
+# Values that make the throwing (non-try) Spark functions fail under ANSI mode.
+ANSI_BREAKERS = ["", "   ", "garbage", None]
+
+
+def _apply(spark, expr, values):
+    """Apply a Column -> Column expression to one string column; {input: output}."""
+    df = spark.createDataFrame([(v,) for v in values], "raw string")
+    return {r.raw: r.out for r in df.select("raw", expr("raw").alias("out")).collect()}
+
+
+def _epoch(*args):
+    """Seconds since the epoch of a UTC wall-clock time (tz-free, unlike collected timestamps)."""
+    return int(datetime(*args, tzinfo=UTC).timestamp())
 
 
 def _normalize(spark, ports):
@@ -127,8 +152,7 @@ def test_integer_overflow_values_are_flagged(spark):
     result = normalize_ports(df)
 
     assert _as_dict(result) == {
-        port: (None, None, False)
-        for port in ["99999999999", "1-99999999999", "99999999999-1"]
+        port: (None, None, False) for port in ["99999999999", "1-99999999999", "99999999999-1"]
     }
 
 
@@ -357,3 +381,310 @@ def test_traffic_ips_fall_in_resolution_ranges(spark, tiny_landing):
 
     assert ips.count() > 0
     assert unmatched.count() == 0
+
+
+# --- event_time -> timestamp, event_date ----------------------------------------------------
+# Timestamps are compared as unix_seconds: collect() turns TimestampType into a naive datetime
+# in the Python process's local zone, which would make the tests machine-dependent.
+
+
+def _event_seconds(spark, values):
+    return _apply(spark, lambda c: F.unix_seconds(parse_event_time(c)), values)
+
+
+def test_parse_event_time_utc_and_offset(spark):
+    result = _event_seconds(
+        spark, ["2025-01-01T03:00:00Z", "2025-01-01T05:00:00+02:00", " 2025-01-01T03:00:00Z "]
+    )
+
+    # All three are the same instant: offsets are applied, whitespace is trimmed.
+    assert result == {
+        "2025-01-01T03:00:00Z": _epoch(2025, 1, 1, 3),
+        "2025-01-01T05:00:00+02:00": _epoch(2025, 1, 1, 3),
+        " 2025-01-01T03:00:00Z ": _epoch(2025, 1, 1, 3),
+    }
+
+
+def test_parse_event_time_invalid_returns_null(spark):
+    values = [
+        *ANSI_BREAKERS,
+        "2025-01-01T03:00:00",  # no offset: would silently depend on the session time zone
+        "2025-01-01 03:00:00Z",  # space instead of T
+        "2025-01-01T03:00:00.123Z",  # fractional seconds: not the landing format
+        "2025-01-01",
+        "2025-02-30T00:00:00Z",  # impossible date
+        "2025-01-01T25:00:00Z",  # impossible hour
+        "2025-13-01T00:00:00Z",
+    ]
+
+    assert _event_seconds(spark, values) == {v: None for v in values}
+
+
+def test_parse_event_time_returns_timestamp_type(spark):
+    df = spark.createDataFrame([("2025-01-01T03:00:00Z",)], "event_time string")
+
+    result = df.select(parse_event_time("event_time").alias("ts"))
+
+    assert result.schema["ts"].dataType.simpleString() == "timestamp"
+
+
+def test_utc_date_of_parsed_event_time(spark):
+    values = ["2025-01-01T00:00:00Z", "2025-01-01T23:59:59Z", "2025-01-02T00:30:00+02:00", None]
+
+    result = _apply(spark, lambda c: utc_date(parse_event_time(c)), values)
+
+    assert result == {
+        "2025-01-01T00:00:00Z": date(2025, 1, 1),
+        "2025-01-01T23:59:59Z": date(2025, 1, 1),
+        "2025-01-02T00:30:00+02:00": date(2025, 1, 1),  # 22:30 UTC the day before
+        None: None,
+    }
+
+
+def test_utc_date_before_epoch_uses_floor(spark):
+    """floor, not truncation toward zero: -1 s is 1969-12-31, not 1970-01-01."""
+    result = _apply(spark, lambda c: utc_date(parse_event_time(c)), ["1969-12-31T23:59:59Z"])
+
+    assert result == {"1969-12-31T23:59:59Z": date(1969, 12, 31)}
+
+
+def test_event_time_and_date_ignore_session_time_zone(spark):
+    """In Los Angeles 03:00Z is still Dec 31: F.to_date(ts) would put it in the wrong partition."""
+    key = "spark.sql.session.timeZone"
+    original = spark.conf.get(key)
+    spark.conf.set(key, "America/Los_Angeles")
+    try:
+        df = spark.createDataFrame([("2025-01-01T03:00:00Z",)], "event_time string")
+        ts = parse_event_time("event_time")
+        row = df.select(F.unix_seconds(ts).alias("s"), utc_date(ts).alias("d")).first()
+    finally:
+        spark.conf.set(key, original)
+
+    assert row == Row(s=_epoch(2025, 1, 1, 3), d=date(2025, 1, 1))
+
+
+# --- destination_port -> int ---------------------------------------------------------------
+
+
+def test_port_to_int_valid(spark):
+    result = _apply(spark, port_to_int, ["1", "443", "65535", " 8080 ", "080"])
+
+    assert result == {"1": 1, "443": 443, "65535": 65535, " 8080 ": 8080, "080": 80}
+
+
+def test_port_to_int_invalid_returns_null(spark):
+    values = [
+        *ANSI_BREAKERS,
+        "0",  # reserved
+        "65536",
+        "-1",  # try_cast would accept it
+        "+80",  # try_cast would accept it
+        "80.0",
+        "1e3",
+        "80-90",  # a range is a rule port spec, not an event port
+        "99999999999",  # overflows int: cast would throw
+    ]
+
+    assert _apply(spark, port_to_int, values) == {v: None for v in values}
+
+
+def test_port_to_int_returns_integer_type(spark):
+    df = spark.createDataFrame([("443",)], "destination_port string")
+
+    result = df.select(port_to_int("destination_port").alias("port"))
+
+    assert result.schema["port"].dataType.simpleString() == "int"
+
+
+# --- user_email, protocol -------------------------------------------------------------------
+
+
+def test_normalize_email(spark):
+    values = ["User@Corp.Example", "  user@corp.example  ", "user@corp.example", "garbage"]
+
+    result = _apply(spark, normalize_email, values)
+
+    assert result == {
+        "User@Corp.Example": "user@corp.example",
+        "  user@corp.example  ": "user@corp.example",
+        "user@corp.example": "user@corp.example",
+        "garbage": "garbage",  # normalized, not validated: it simply matches no user
+    }
+
+
+def test_normalize_email_blank_is_null(spark):
+    assert _apply(spark, normalize_email, ["", "   ", None]) == {"": None, "   ": None, None: None}
+
+
+def test_normalize_protocol(spark):
+    result = _apply(spark, normalize_protocol, ["tcp", " Udp ", "TCP", "garbage"])
+
+    assert result == {"tcp": "TCP", " Udp ": "UDP", "TCP": "TCP", "garbage": "GARBAGE"}
+
+
+def test_normalize_protocol_blank_is_null(spark):
+    result = _apply(spark, normalize_protocol, ["", "   ", None])
+
+    assert result == {"": None, "   ": None, None: None}
+
+
+def test_traffic_log_columns_parse_on_generated_data(spark, tiny_landing):
+    """Confidence check: no generated event loses its time, port, email or protocol.
+
+    Malformed CSV rows (an extra field) are excluded via _corrupt_record: their values are
+    unreliable by design. Every other row must parse, and event_date must equal the landing
+    date for on-time events (late events land in a later batch_date folder).
+    """
+    events = io.read_landing(spark, tiny_landing.root, io.EVENT_ENTITY).cache()
+    parsed = events.where(F.col(io.CORRUPT_COLUMN).isNull()).select(
+        parse_event_time("event_time").alias("ts"),
+        port_to_int("destination_port").alias("port"),
+        normalize_email("user_email").alias("email"),
+        normalize_protocol("protocol").alias("protocol"),
+        io.BATCH_COLUMN,
+    )
+    failed = parsed.where(
+        F.col("ts").isNull()
+        | F.col("port").isNull()
+        | F.col("email").isNull()
+        | ~F.col("protocol").isin("TCP", "UDP")
+    )
+    on_time = parsed.where(utc_date(F.col("ts")) == F.col(io.BATCH_COLUMN))
+
+    assert parsed.count() > 0
+    assert failed.count() == 0
+    assert on_time.count() > 0
+    assert parsed.where(utc_date(F.col("ts")) > F.col(io.BATCH_COLUMN)).count() == 0
+    events.unpersist()
+
+
+# --- traffic_events ------------------------------------------------------------------------------
+
+BRONZE_TRAFFIC = (
+    "event_id string, event_time string, user_email string, destination_ip string, "
+    "destination_port string, protocol string, action string, _corrupt_record string, "
+    "source_file string, batch_date date, ingest_ts timestamp"
+)
+INGEST_TS = datetime(2025, 1, 10, tzinfo=UTC)
+
+
+def _bronze_event(
+    event_id="evt1",
+    action="ALLOW",
+    batch_date=date(2025, 1, 1),
+    corrupt=None,
+    event_time="2025-01-01T03:00:00Z",
+    port="443",
+):
+    """One bronze traffic row with valid defaults; override only what a test is about."""
+    source = f"traffic_logs/batch_date={batch_date}/part-0.csv"
+    return (
+        event_id,
+        event_time,
+        " Alice@Corp.Example ",
+        "10.0.0.1",
+        port,
+        "tcp",
+        action,
+        corrupt,
+        source,
+        batch_date,
+        INGEST_TS,
+    )
+
+
+def _events(spark, *rows):
+    return traffic_events(spark.createDataFrame(list(rows), BRONZE_TRAFFIC))
+
+
+def test_traffic_events_parsed_take_plain_names_raw_kept(spark):
+    row = _events(spark, _bronze_event()).first()
+
+    # Parsed values take the plain names...
+    assert row.event_date == date(2025, 1, 1)
+    assert row.user_email == "alice@corp.example"
+    assert row.destination_ip == 167772161
+    assert row.destination_port == 443
+    assert row.protocol == "TCP"
+    # ...and the bronze values are kept unchanged as *_raw.
+    assert row.event_time_raw == "2025-01-01T03:00:00Z"
+    assert row.user_email_raw == " Alice@Corp.Example "
+    assert row.destination_ip_raw == "10.0.0.1"
+    assert row.destination_port_raw == "443"
+    assert row.protocol_raw == "tcp"
+    assert row.is_corrupt is False
+
+
+def test_traffic_events_schema(spark):
+    types = dict(_events(spark, _bronze_event()).dtypes)
+
+    assert types["event_ts"] == "timestamp"
+    assert types["event_date"] == "date"
+    assert types["user_email"] == "string"
+    assert types["destination_ip"] == "bigint"
+    assert types["destination_port"] == "int"
+    assert types["destination_ip_raw"] == "string"
+    assert types["destination_port_raw"] == "string"
+    assert types["is_corrupt"] == "boolean"
+    assert "_copy" not in types  # the dedup helper column does not leak
+
+
+def test_traffic_events_keeps_allow_only(spark):
+    result = _events(
+        spark,
+        _bronze_event("a", action="ALLOW"),
+        _bronze_event("d", action="DENY"),
+        _bronze_event("n", action=None),
+    )
+
+    assert [r.event_id for r in result.collect()] == ["a"]
+
+
+def test_traffic_events_flags_corrupt_rows_without_dropping_them(spark):
+    result = _events(
+        spark,
+        _bronze_event("ok"),
+        _bronze_event("bad", corrupt="evt,...,ALLOW,EXTRA"),
+    )
+
+    assert {r.event_id: r.is_corrupt for r in result.collect()} == {"ok": False, "bad": True}
+
+
+def test_traffic_events_bad_values_become_null_not_errors(spark):
+    """ANSI breakers in every parsed column: the row survives with nulls, the job does not fail."""
+    row = _events(spark, _bronze_event(event_time="garbage", port="")).first()
+
+    assert row.event_ts is None
+    assert row.event_date is None
+    assert row.destination_port is None
+    assert row.destination_port_raw == ""
+
+
+def test_traffic_events_dedup_keeps_earliest_batch(spark):
+    result = _events(
+        spark,
+        _bronze_event("dup", batch_date=date(2025, 1, 2)),
+        _bronze_event("dup", batch_date=date(2025, 1, 1)),
+        _bronze_event("other"),
+    )
+
+    rows = {r.event_id: r.batch_date for r in result.collect()}
+    assert rows == {"dup": date(2025, 1, 1), "other": date(2025, 1, 1)}
+
+
+def test_traffic_events_dedup_prefers_clean_copy_over_earlier_corrupt_one(spark):
+    result = _events(
+        spark,
+        _bronze_event("dup", batch_date=date(2025, 1, 1), corrupt="raw text"),
+        _bronze_event("dup", batch_date=date(2025, 1, 2)),
+    )
+
+    row = result.first()
+    assert result.count() == 1
+    assert (row.batch_date, row.is_corrupt) == (date(2025, 1, 2), False)
+
+
+def test_traffic_events_does_not_collapse_null_event_ids(spark):
+    result = _events(spark, _bronze_event(None), _bronze_event(None), _bronze_event("x"))
+
+    assert result.count() == 3
