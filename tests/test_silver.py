@@ -76,22 +76,20 @@ def test_boundaries_are_inclusive(spark):
 
 
 def test_output_columns_are_integers_and_raw_port_is_kept(spark):
-    schema = _normalize(spark, ["1-20"]).schema
-
     df = spark.createDataFrame([(" 443 ",), (" 1-20 ",)], ["port"])
 
     result = normalize_ports(df)
 
     expected = [
-        Row(port_start=443, port_end=443),
-        Row(port_start=1, port_end=20),
+        Row(port=" 443 ", port_start=443, port_end=443, port_spec_valid=True),
+        Row(port=" 1-20 ", port_start=1, port_end=20, port_spec_valid=True),
     ]
 
     assert result.collect() == expected
 
 
-def test_invalid_port_values_are_filtered(spark):
-    """Malformed port values should be filtered out."""
+def test_invalid_port_values_are_flagged(spark):
+    """Malformed port values should be retained with null bounds and a false flag."""
 
     df = spark.createDataFrame(
         [
@@ -108,11 +106,14 @@ def test_invalid_port_values_are_filtered(spark):
 
     result = normalize_ports(df)
 
-    assert result.count() == 0
+    assert _as_dict(result) == {
+        port: (None, None, False)
+        for port in ["abc", "80-abc", "-20", "80-", "80-90-100", "", "   "]
+    }
 
 
-def test_integer_overflow_values_are_filtered(spark):
-    """Values that overflow INT should be filtered, not crash the cast (ANSI mode)."""
+def test_integer_overflow_values_are_flagged(spark):
+    """Values that overflow INT should be flagged, not crash the cast (ANSI mode)."""
 
     df = spark.createDataFrame(
         [
@@ -125,11 +126,14 @@ def test_integer_overflow_values_are_filtered(spark):
 
     result = normalize_ports(df)
 
-    assert result.count() == 0
+    assert _as_dict(result) == {
+        port: (None, None, False)
+        for port in ["99999999999", "1-99999999999", "99999999999-1"]
+    }
 
 
-def test_out_of_range_ports_are_filtered(spark):
-    """Ports outside 1-65535 should be filtered out (port 0 is reserved)."""
+def test_out_of_range_ports_are_flagged(spark):
+    """Ports outside 1-65535 should be retained with a false validity flag."""
 
     df = spark.createDataFrame(
         [
@@ -145,11 +149,14 @@ def test_out_of_range_ports_are_filtered(spark):
 
     result = normalize_ports(df)
 
-    assert result.count() == 0
+    assert _as_dict(result) == {
+        port: (None, None, False)
+        for port in ["0", "0-65535", "-1", "65536", "1-65536", "65536-65536"]
+    }
 
 
-def test_invalid_range_order_is_filtered(spark):
-    """A range where start is greater than end should be filtered."""
+def test_invalid_range_order_is_flagged(spark):
+    """A range where start is greater than end should be retained and flagged."""
 
     df = spark.createDataFrame(
         [
@@ -161,11 +168,14 @@ def test_invalid_range_order_is_filtered(spark):
 
     result = normalize_ports(df)
 
-    assert result.count() == 0
+    assert _as_dict(result) == {
+        "20-10": (None, None, False),
+        "100-50": (None, None, False),
+    }
 
 
 def test_mixed_valid_and_invalid_ports(spark):
-    """Only valid rows should remain after normalization."""
+    """Valid and invalid rows should remain with normalized values or invalid flags."""
 
     df = spark.createDataFrame(
         [
@@ -181,25 +191,30 @@ def test_mixed_valid_and_invalid_ports(spark):
 
     result = normalize_ports(df)
 
-    expected = [
-        Row(port_start=49, port_end=49),
-        Row(port_start=1, port_end=20),
-        Row(port_start=100, port_end=200),
-    ]
+    assert _as_dict(result) == {
+        "49": (49, 49, True),
+        "1-20": (1, 20, True),
+        "invalid": (None, None, False),
+        "65536": (None, None, False),
+        "100-200": (100, 200, True),
+        "99999999999": (None, None, False),
+    }
 
-    assert result.collect() == expected
 
-
-def test_original_port_column_is_removed(spark):
-    """The original port column should not exist in the output."""
+def test_original_port_column_is_preserved(spark):
+    """The raw port column should remain alongside the normalized columns."""
 
     df = spark.createDataFrame([("49",)], ["port"])
 
     result = normalize_ports(df)
 
-    assert "port" not in result.columns
+    assert "port" in result.columns
     assert "port_start" in result.columns
     assert "port_end" in result.columns
+    assert "port_spec_valid" in result.columns
+    assert result.select("port", "port_start", "port_end", "port_spec_valid").first() == Row(
+        port="49", port_start=49, port_end=49, port_spec_valid=True
+    )
 
 
 def test_output_columns_are_integers(spark):
