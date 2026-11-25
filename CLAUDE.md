@@ -80,6 +80,8 @@ digits, `None`).
 - `docs/architecture.md`: the authoritative design (domain model, exact matching join path,
   pipeline layers, decisions). Read it before changing a layer.
 - `docs/later.md`: parking lot for tangents.
+- `docs/spark-ui.md`: how to keep the Spark UI open (interactive session) or replay finished
+  runs (event logs + History Server). Follow it when the user wants to inspect plans/stages.
 - `pyspark-databricks-portfolio-plan.md` (repo root, **gitignored, private**, may not exist on
   every machine): goals, session plan, working agreement and decision log. Read it at the start of
   a session when present; never commit it or quote private background from it into the repo.
