@@ -9,6 +9,8 @@ from netusage import config as C
 from netusage import io
 from netusage.transforms.bronze import add_ingest_metadata
 from netusage.transforms.silver import (
+    ad_groups,
+    apps,
     ip_to_long,
     latest_snapshot,
     normalize_email,
@@ -970,3 +972,110 @@ def test_vpn_rules_on_generated_data(spark, tiny_landing):
     assert silver.where(~F.col("port_spec_valid") | F.col("is_corrupt")).count() == 0
     assert {r.protocol for r in silver.select("protocol").distinct().collect()} <= {"TCP", "UDP"}
     silver.unpersist()
+
+
+# --- apps and ad_groups --------------------------------------------------------------------------
+
+BRONZE_APPS = (
+    "sys_id string, name string, department string, "
+    "_corrupt_record string, source_file string, batch_date date, ingest_ts timestamp"
+)
+BRONZE_GROUPS = (
+    "group_id string, name string, domain string, "
+    "_corrupt_record string, source_file string, batch_date date, ingest_ts timestamp"
+)
+
+
+def _bronze_snapshot_row(key, a, b, corrupt=None, batch_date=SNAPSHOT_DATE):
+    """One bronze row of a 3-column snapshot entity (apps or ad_group) plus metadata."""
+    return (key, a, b, corrupt, "part-0", batch_date, INGEST_TS)
+
+
+def test_apps_latest_snapshot_and_corrupt_flag(spark):
+    bronze = spark.createDataFrame(
+        [
+            _bronze_snapshot_row("a1", "app-old", "IT", batch_date=date(2025, 1, 1)),
+            _bronze_snapshot_row("a1", "app-new", "IT"),
+            _bronze_snapshot_row(None, None, None, corrupt="{broken"),
+        ],
+        BRONZE_APPS,
+    )
+
+    rows = {(r.sys_id, r.name, r.is_corrupt) for r in apps(bronze).collect()}
+
+    assert rows == {("a1", "app-new", False), (None, None, True)}
+
+
+def test_apps_schema(spark):
+    bronze = spark.createDataFrame([_bronze_snapshot_row("a1", "app", "IT")], BRONZE_APPS)
+
+    assert apps(bronze).columns == [
+        "sys_id",
+        "name",
+        "department",
+        "_corrupt_record",
+        "is_corrupt",
+        "source_file",
+        "batch_date",
+        "ingest_ts",
+    ]
+
+
+def test_ad_groups_latest_snapshot_and_corrupt_flag(spark):
+    bronze = spark.createDataFrame(
+        [
+            _bronze_snapshot_row("g1", "grp-old", "corp.example", batch_date=date(2025, 1, 1)),
+            _bronze_snapshot_row("g1", "grp-new", "corp.example"),
+            _bronze_snapshot_row("g2", "grp-x", "corp.example", corrupt="g2,grp-x,corp,EXTRA"),
+        ],
+        BRONZE_GROUPS,
+    )
+
+    rows = {(r.group_id, r.name, r.is_corrupt) for r in ad_groups(bronze).collect()}
+
+    assert rows == {("g1", "grp-new", False), ("g2", "grp-x", True)}
+
+
+def test_ad_groups_names_are_not_normalized(spark):
+    """Rules match groups by the exact (name, domain) they write; silver must not change it."""
+    bronze = spark.createDataFrame(
+        [_bronze_snapshot_row("g1", " Grp-Mixed ", "EU.corp.example")], BRONZE_GROUPS
+    )
+
+    row = ad_groups(bronze).first()
+
+    assert (row.name, row.domain) == (" Grp-Mixed ", "EU.corp.example")
+
+
+def test_ad_groups_schema(spark):
+    bronze = spark.createDataFrame(
+        [_bronze_snapshot_row("g1", "grp", "corp.example")], BRONZE_GROUPS
+    )
+
+    assert ad_groups(bronze).columns == [
+        "group_id",
+        "name",
+        "domain",
+        "_corrupt_record",
+        "is_corrupt",
+        "source_file",
+        "batch_date",
+        "ingest_ts",
+    ]
+
+
+def test_apps_and_ad_groups_on_generated_data(spark, tiny_landing):
+    silver_apps = apps(_tiny_bronze(spark, tiny_landing, "apps"))
+    groups = ad_groups(_tiny_bronze(spark, tiny_landing, "ad_group")).cache()
+
+    assert silver_apps.count() == C.TINY.apps
+    assert silver_apps.select("sys_id").distinct().count() == C.TINY.apps
+
+    total = groups.count()
+    assert total == C.TINY.ad_groups
+    assert groups.where("is_corrupt").count() == 0
+    # The pair is the key rules use: unique...
+    assert groups.select("name", "domain").distinct().count() == total
+    # ...while the name alone is not, which is why rules carry the domain too.
+    assert groups.select("name").distinct().count() < total
+    groups.unpersist()
