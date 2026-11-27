@@ -21,6 +21,7 @@ from netusage.transforms.silver import (
     parse_event_time,
     port_to_int,
     resolution_states,
+    rule_access,
     traffic_events,
     users,
     utc_date,
@@ -927,13 +928,14 @@ def _bronze_rule(
     status=C.OPERATIONAL_STATUS_ACTIVE,
     corrupt=None,
     batch_date=SNAPSHOT_DATE,
+    resource="srv-db-0001",
 ):
     """One bronze vpn_rules row with valid defaults; override only what a test is about."""
     return (
         sys_id,
         "app1",
         "gw-01",
-        "srv-db-0001",
+        resource,
         port,
         protocol,
         "grp-0001",
@@ -1328,10 +1330,11 @@ def _bronze_state(
     first_seen=JAN_1,
     last_seen=JAN_2,
     batch_date=SNAPSHOT_DATE,
+    resource="srv-db-0001",
 ):
     """One bronze resolution row with valid defaults; override only what a test is about."""
     return (
-        "srv-db-0001",
+        resource,
         state_id,
         ip_start,
         ip_end,
@@ -1455,3 +1458,151 @@ def test_resolution_states_on_generated_data(spark, tiny_landing):
     ordered = states.withColumn("prev_last_seen", F.lag("last_seen").over(by_resource))
     assert ordered.where(F.col("first_seen") < F.col("prev_last_seen")).count() == 0
     silver.unpersist()
+
+
+# --- rule_access ---------------------------------------------------------------------------------
+
+
+def _access(spark, rule_rows, state_rows):
+    """Build silver rules and states from bronze rows, then rule_access."""
+    rules = _rules(spark, *rule_rows)
+    states = (
+        _states(spark, *state_rows)
+        if state_rows
+        else resolution_states(spark.createDataFrame([], BRONZE_RESOLUTIONS))
+    )
+    return rule_access(rules, states)
+
+
+def test_rule_access_one_row_per_state_and_range(spark):
+    """A rule gets every (state, range) of its resource: 2 states, one with 2 ranges -> 3 rows."""
+    result = _access(
+        spark,
+        [_bronze_rule("r1")],
+        [
+            _bronze_state("s1", ip_start=10, ip_end=10),
+            _bronze_state("s1", ip_start=20, ip_end=20),  # same state, second IP range
+            _bronze_state("s2", ip_start=30, ip_end=30, first_seen=JAN_2, last_seen=None),
+            _bronze_state("other", resource="srv-web-0002"),  # another resource: not joined
+        ],
+    )
+
+    rows = sorted((r.state_id, r.ip_start) for r in result.collect())
+    assert rows == [("s1", 10), ("s1", 20), ("s2", 30)]
+    assert all(r.rule_sys_id == "r1" and r.has_resolution for r in result.collect())
+
+
+def test_rule_access_every_rule_on_a_resource_gets_its_states(spark):
+    """Two rules on one resource: the states are repeated per rule (fan-out is intended here)."""
+    result = _access(
+        spark,
+        [_bronze_rule("r1"), _bronze_rule("r2", port="443")],
+        [_bronze_state("s1", ip_start=10, ip_end=10), _bronze_state("s1", ip_start=20, ip_end=20)],
+    )
+
+    assert result.count() == 4
+    assert {r.rule_sys_id for r in result.collect()} == {"r1", "r2"}
+
+
+def test_rule_access_rule_without_resolution_is_kept_and_flagged(spark):
+    result = _access(
+        spark,
+        [_bronze_rule("r1"), _bronze_rule("lonely", resource="srv-missing-0001")],
+        [_bronze_state("s1")],
+    )
+
+    lonely = result.where(F.col("rule_sys_id") == "lonely").collect()
+    assert len(lonely) == 1
+    row = lonely[0]
+    assert row.has_resolution is False
+    assert (row.state_id, row.ip_start, row.first_seen) == (None, None, None)
+    # Strictly boolean: False, not None (where(~flag) must find these rows).
+    assert (row.ip_range_valid, row.period_valid) == (False, False)
+
+
+def test_rule_access_no_states_at_all(spark):
+    result = _access(spark, [_bronze_rule("r1")], [])
+
+    assert [(r.rule_sys_id, r.has_resolution) for r in result.collect()] == [("r1", False)]
+
+
+def test_rule_access_carries_invalid_flags_without_dropping(spark):
+    result = _access(
+        spark,
+        [_bronze_rule("bad_port", port="99-1")],
+        [
+            _bronze_state("ok"),
+            _bronze_state("bad_range", ip_start=20, ip_end=10),
+            _bronze_state("bad_period", first_seen=JAN_2, last_seen=JAN_1),
+        ],
+    )
+
+    flags = {
+        r.state_id: (r.port_spec_valid, r.ip_range_valid, r.period_valid) for r in result.collect()
+    }
+    assert flags == {
+        "ok": (False, True, True),
+        "bad_range": (False, False, True),
+        "bad_period": (False, True, False),
+    }
+
+
+def test_rule_access_keeps_corrupt_rules(spark):
+    """A corrupt rule has a null resource: it matches no state but keeps its row, flagged."""
+    corrupt = (None,) * 9 + ("{not json", "vpn_rules/part-0.json", SNAPSHOT_DATE, INGEST_TS)
+    result = _access(spark, [_bronze_rule("r1"), corrupt], [_bronze_state("s1")])
+
+    rows = {(r.rule_sys_id, r.is_corrupt, r.has_resolution) for r in result.collect()}
+    assert rows == {("r1", False, True), (None, True, False)}
+
+
+def test_rule_access_schema(spark):
+    result = _access(spark, [_bronze_rule()], [_bronze_state()])
+
+    assert result.columns == [
+        "rule_sys_id",
+        "app_sys_id",
+        "gateway",
+        "resource",
+        "protocol",
+        "port_start",
+        "port_end",
+        "ad_group_name",
+        "ad_group_domain",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        "has_resolution",
+        "port_spec_valid",
+        "ip_range_valid",
+        "period_valid",
+        "is_corrupt",
+    ]
+    types = dict(result.dtypes)
+    assert (types["ip_start"], types["port_start"]) == ("bigint", "int")
+    assert types["has_resolution"] == "boolean"
+
+
+def test_rule_access_on_generated_data(spark, tiny_landing):
+    rules = vpn_rules(_tiny_bronze(spark, tiny_landing, "vpn_rules")).cache()
+    states = resolution_states(_tiny_bronze(spark, tiny_landing, "resource_resolution")).cache()
+    access = rule_access(rules, states).cache()
+
+    # Every rule is there, and every generated rule's resource has resolutions.
+    assert access.select("rule_sys_id").distinct().count() == rules.count()
+    assert access.where(~F.col("has_resolution")).count() == 0
+    # Row count = for each rule, the number of state rows of its resource.
+    rows_per_resource = states.groupBy("resource_name").count()
+    expected = (
+        rules.join(rows_per_resource, rules["resource"] == rows_per_resource["resource_name"])
+        .agg(F.sum("count"))
+        .first()[0]
+    )
+    assert access.count() == expected
+    # Generated data is clean: every row is usable by matching.
+    usable = F.col("port_spec_valid") & F.col("ip_range_valid") & F.col("period_valid")
+    assert access.where(~usable).count() == 0
+    for df in (access, states, rules):
+        df.unpersist()
