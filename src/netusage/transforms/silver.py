@@ -290,6 +290,43 @@ def users(bronze: DataFrame) -> DataFrame:
     )
 
 
+def apps(bronze: DataFrame) -> DataFrame:
+    """Build silver apps from bronze ``apps`` (all snapshots).
+
+    Latest snapshot plus an ``is_corrupt`` flag. No business filter and nothing to normalize:
+    rules reference apps by ``sys_id``, copied as is.
+    """
+    return latest_snapshot(bronze).select(
+        "sys_id",
+        "name",
+        "department",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
+def ad_groups(bronze: DataFrame) -> DataFrame:
+    """Build silver AD groups from bronze ``ad_group`` (all snapshots).
+
+    Latest snapshot plus an ``is_corrupt`` flag. ``name`` and ``domain`` are NOT normalized:
+    rules reference a group by the exact ``(name, domain)`` pair, and a name alone is not
+    unique (the same name exists in several domains).
+    """
+    return latest_snapshot(bronze).select(
+        "group_id",
+        "name",
+        "domain",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
+
+
 def vpn_rules(bronze: DataFrame) -> DataFrame:
     """Build silver VPN rules from bronze ``vpn_rules`` (all snapshots).
 
