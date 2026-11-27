@@ -5,7 +5,9 @@ from datetime import UTC, date, datetime
 from pyspark.sql import Row
 from pyspark.sql import functions as F
 
+from netusage import config as C
 from netusage import io
+from netusage.transforms.bronze import add_ingest_metadata
 from netusage.transforms.silver import (
     ip_to_long,
     latest_snapshot,
@@ -15,7 +17,9 @@ from netusage.transforms.silver import (
     parse_event_time,
     port_to_int,
     traffic_events,
+    users,
     utc_date,
+    vpn_rules,
 )
 
 # Values that make the throwing (non-try) Spark functions fail under ANSI mode.
@@ -651,6 +655,14 @@ def test_traffic_events_flags_corrupt_rows_without_dropping_them(spark):
     assert {r.event_id: r.is_corrupt for r in result.collect()} == {"ok": False, "bad": True}
 
 
+def test_traffic_events_keeps_corrupt_rows_with_null_action(spark):
+    """A CSV row with too few fields has null trailing columns; the ALLOW filter must keep it."""
+    short_row = _bronze_event("short", action=None, corrupt="short,2025-01-01T03:00:00Z")
+    result = _events(spark, _bronze_event("ok"), short_row, _bronze_event("deny", action="DENY"))
+
+    assert {r.event_id: r.is_corrupt for r in result.collect()} == {"ok": False, "short": True}
+
+
 def test_traffic_events_bad_values_become_null_not_errors(spark):
     """ANSI breakers in every parsed column: the row survives with nulls, the job does not fail."""
     row = _events(spark, _bronze_event(event_time="garbage", port="")).first()
@@ -730,3 +742,231 @@ def test_latest_snapshot_empty_input_gives_empty_output(spark):
     df = spark.createDataFrame([], SNAPSHOT)
 
     assert latest_snapshot(df).count() == 0
+
+
+# --- users ---------------------------------------------------------------------------------------
+
+BRONZE_USERS = (
+    "sys_id string, email string, department string, site string, status int, "
+    "_corrupt_record string, source_file string, batch_date date, ingest_ts timestamp"
+)
+SNAPSHOT_DATE = date(2025, 1, 5)
+
+
+def _bronze_user(
+    sys_id="u1",
+    email=" Alice@Corp.Example ",
+    status=C.USER_STATUS_ACTIVE,
+    corrupt=None,
+    batch_date=SNAPSHOT_DATE,
+):
+    """One bronze users row with valid defaults; override only what a test is about."""
+    return (
+        sys_id,
+        email,
+        "IT",
+        "site-01",
+        status,
+        corrupt,
+        "users/part-0.json",
+        batch_date,
+        INGEST_TS,
+    )
+
+
+def _users(spark, *rows):
+    return users(spark.createDataFrame(list(rows), BRONZE_USERS))
+
+
+def test_users_email_normalized_raw_kept(spark):
+    row = _users(spark, _bronze_user()).first()
+
+    assert row.email == "alice@corp.example"
+    assert row.email_raw == " Alice@Corp.Example "
+    assert row.is_corrupt is False
+
+
+def test_users_keeps_active_only(spark):
+    result = _users(
+        spark,
+        _bronze_user("active", status=C.USER_STATUS_ACTIVE),
+        _bronze_user("disabled", status=0),
+        _bronze_user("other", status=4),
+        _bronze_user("no_status", status=None),
+    )
+
+    assert [r.sys_id for r in result.collect()] == ["active"]
+
+
+def test_users_keeps_corrupt_rows_flagged(spark):
+    """An unparseable JSON line has every column null (status too): it must not vanish."""
+    corrupt = (
+        None,
+        None,
+        None,
+        None,
+        None,
+        '{"sys_id": "u9", "email": ',
+        "users/part-0.json",
+        SNAPSHOT_DATE,
+        INGEST_TS,
+    )
+    result = _users(spark, _bronze_user("ok"), corrupt)
+
+    assert {r.sys_id: r.is_corrupt for r in result.collect()} == {"ok": False, None: True}
+
+
+def test_users_latest_snapshot_only(spark):
+    result = _users(
+        spark,
+        _bronze_user("u1", email="old@corp.example", batch_date=date(2025, 1, 1)),
+        _bronze_user("u1", email="new@corp.example"),
+    )
+
+    assert [r.email for r in result.collect()] == ["new@corp.example"]
+
+
+def test_users_schema(spark):
+    types = dict(_users(spark, _bronze_user()).dtypes)
+
+    assert list(types) == [
+        "sys_id",
+        "email_raw",
+        "email",
+        "department",
+        "site",
+        "status",
+        "_corrupt_record",
+        "is_corrupt",
+        "source_file",
+        "batch_date",
+        "ingest_ts",
+    ]
+    assert types["email"] == "string"
+    assert types["is_corrupt"] == "boolean"
+
+
+# --- vpn_rules -----------------------------------------------------------------------------------
+
+BRONZE_RULES = (
+    "sys_id string, app_sys_id string, gateway string, resource string, port string, "
+    "protocol string, ad_group_name string, ad_group_domain string, operational_status int, "
+    "_corrupt_record string, source_file string, batch_date date, ingest_ts timestamp"
+)
+
+
+def _bronze_rule(
+    sys_id="r1",
+    port="8000-8100",
+    protocol=" tcp ",
+    status=C.OPERATIONAL_STATUS_ACTIVE,
+    corrupt=None,
+    batch_date=SNAPSHOT_DATE,
+):
+    """One bronze vpn_rules row with valid defaults; override only what a test is about."""
+    return (
+        sys_id,
+        "app1",
+        "gw-01",
+        "srv-db-0001",
+        port,
+        protocol,
+        "grp-0001",
+        "corp.example",
+        status,
+        corrupt,
+        "vpn_rules/part-0.json",
+        batch_date,
+        INGEST_TS,
+    )
+
+
+def _rules(spark, *rows):
+    return vpn_rules(spark.createDataFrame(list(rows), BRONZE_RULES))
+
+
+def test_vpn_rules_ports_and_protocol_parsed_raw_kept(spark):
+    row = _rules(spark, _bronze_rule()).first()
+
+    assert (row.port_start, row.port_end, row.port_spec_valid) == (8000, 8100, True)
+    assert row.port_raw == "8000-8100"
+    assert row.protocol == "TCP"
+    assert row.protocol_raw == " tcp "
+    assert row.is_corrupt is False
+
+
+def test_vpn_rules_invalid_port_flagged_not_dropped(spark):
+    result = _rules(spark, _bronze_rule("ok"), _bronze_rule("bad", port="99-1"))
+
+    flags = {r.sys_id: (r.port_start, r.port_spec_valid) for r in result.collect()}
+    assert flags == {"ok": (8000, True), "bad": (None, False)}
+
+
+def test_vpn_rules_keeps_operational_only(spark):
+    result = _rules(
+        spark,
+        _bronze_rule("on", status=C.OPERATIONAL_STATUS_ACTIVE),
+        _bronze_rule("off", status=0),
+        _bronze_rule("suspended", status=3),
+    )
+
+    assert [r.sys_id for r in result.collect()] == ["on"]
+
+
+def test_vpn_rules_keeps_corrupt_rows_flagged(spark):
+    corrupt = (None,) * 9 + ("{not json", "vpn_rules/part-0.json", SNAPSHOT_DATE, INGEST_TS)
+    result = _rules(spark, _bronze_rule("ok"), corrupt)
+
+    assert {r.sys_id: r.is_corrupt for r in result.collect()} == {"ok": False, None: True}
+
+
+def test_vpn_rules_latest_snapshot_only(spark):
+    result = _rules(
+        spark,
+        _bronze_rule("r1", port="22", batch_date=date(2025, 1, 1)),
+        _bronze_rule("r1", port="443"),
+    )
+
+    assert [r.port_raw for r in result.collect()] == ["443"]
+
+
+def test_vpn_rules_schema(spark):
+    types = dict(_rules(spark, _bronze_rule()).dtypes)
+
+    assert "port" not in types  # renamed to port_raw
+    assert types["port_raw"] == "string"
+    assert types["port_start"] == "int"
+    assert types["port_end"] == "int"
+    assert types["port_spec_valid"] == "boolean"
+    assert types["protocol"] == "string"
+    assert types["is_corrupt"] == "boolean"
+
+
+# --- users and vpn_rules on generated TINY data --------------------------------------------------
+
+
+def _tiny_bronze(spark, tiny_landing, entity):
+    """Landing snapshot + bronze metadata, as the bronze job would store it (no Delta write)."""
+    landing = io.read_landing(spark, tiny_landing.root, entity)
+    return add_ingest_metadata(landing, INGEST_TS, batch_date=tiny_landing.end)
+
+
+def test_users_on_generated_data(spark, tiny_landing):
+    bronze = _tiny_bronze(spark, tiny_landing, "users")
+    silver = users(bronze).cache()
+
+    assert silver.count() == bronze.where(F.col("status") == C.USER_STATUS_ACTIVE).count()
+    assert silver.where(F.col("email").isNull() | F.col("is_corrupt")).count() == 0
+    assert silver.select("email").distinct().count() == silver.count()  # emails stay unique
+    silver.unpersist()
+
+
+def test_vpn_rules_on_generated_data(spark, tiny_landing):
+    bronze = _tiny_bronze(spark, tiny_landing, "vpn_rules")
+    silver = vpn_rules(bronze).cache()
+
+    operational = bronze.where(F.col("operational_status") == C.OPERATIONAL_STATUS_ACTIVE)
+    assert silver.count() == operational.count()
+    assert silver.where(~F.col("port_spec_valid") | F.col("is_corrupt")).count() == 0
+    assert {r.protocol for r in silver.select("protocol").distinct().collect()} <= {"TCP", "UDP"}
+    silver.unpersist()
