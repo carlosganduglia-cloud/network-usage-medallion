@@ -490,3 +490,78 @@ def resolution_states(bronze: DataFrame) -> DataFrame:
         BATCH_COLUMN,
         "ingest_ts",
     )
+
+
+def rule_access(rules: DataFrame, states: DataFrame) -> DataFrame:
+    """What each rule grants, over time: silver ``vpn_rules`` joined with ``resolution_states``.
+
+    Inputs:
+    - ``rules``: silver ``vpn_rules`` (latest snapshot, operational, ports parsed).
+    - ``states``: silver ``resolution_states``.
+
+    One row per (rule, state, IP range): a rule whose resource resolved to 3 states with 2
+    ranges each gets 6 rows. That multiplication is the point: the matching join (Session 4)
+    looks for the row whose IP range, port range, protocol and period contain an event.
+
+    Nothing is dropped; the flags from both inputs are carried through so matching can choose
+    the usable rows in one place:
+    - ``has_resolution``: false for a rule whose resource has no resolution at all (left join).
+      Such a rule keeps one row with null IP and period columns; it can never be used.
+    - ``port_spec_valid``, ``ip_range_valid``, ``period_valid``, ``is_corrupt``: as in the
+      inputs. The state flags are false (never null) on rows without a resolution.
+    """
+    # Only the columns rule_access needs, renamed where they would be ambiguous after the join
+    # (both tables have source_file, batch_date, ingest_ts; "sys_id" is clearer as rule_sys_id).
+    rule_cols = rules.select(
+        F.col("sys_id").alias("rule_sys_id"),
+        "app_sys_id",
+        "gateway",
+        "resource",
+        "protocol",
+        "port_start",
+        "port_end",
+        "port_spec_valid",
+        "ad_group_name",
+        "ad_group_domain",
+        "is_corrupt",
+    )
+    state_cols = states.select(
+        "resource_name",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        "ip_range_valid",
+        "period_valid",
+    )
+    # The key columns have different names, so join on an expression (both columns are kept;
+    # resource_name is dropped below). A null resource matches nothing and keeps its row.
+    joined = rule_cols.join(
+        state_cols, rule_cols["resource"] == state_cols["resource_name"], "left"
+    )
+
+    # resource_name comes from the states side: it is null exactly when no state matched.
+    has_resolution = F.col("resource_name").isNotNull()
+    return joined.select(
+        "rule_sys_id",
+        "app_sys_id",
+        "gateway",
+        "resource",
+        "protocol",
+        "port_start",
+        "port_end",
+        "ad_group_name",
+        "ad_group_domain",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        has_resolution.alias("has_resolution"),
+        "port_spec_valid",
+        # Unmatched rows get null here from the left join; keep the flags strictly boolean.
+        F.coalesce("ip_range_valid", F.lit(False)).alias("ip_range_valid"),
+        F.coalesce("period_valid", F.lit(False)).alias("period_valid"),
+        "is_corrupt",
+    )
