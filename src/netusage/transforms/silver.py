@@ -204,8 +204,14 @@ def latest_snapshot(bronze: DataFrame) -> DataFrame:
     return latest.select(*bronze.columns)
 
 
-def traffic_events(bronze: DataFrame) -> DataFrame:
+def traffic_events(bronze: DataFrame, all_users: DataFrame) -> DataFrame:
     """Build silver traffic events from a slice of bronze ``traffic_logs``.
+
+    Inputs:
+    - ``bronze``: a slice of bronze ``traffic_logs`` (the rows transformed).
+    - ``all_users``: EVERY user in the directory, active or not, e.g. ``latest_snapshot`` of
+      bronze ``users`` (only ``email`` is used). Not silver ``users``: a disabled user's event
+      comes from a real person, so it is not an unknown user.
 
     Steps, in order:
     1. Keep ALLOW events only (a business filter, not a validity check). Corrupt rows are kept
@@ -216,6 +222,9 @@ def traffic_events(bronze: DataFrame) -> DataFrame:
     3. Flag rows Spark could not parse: ``is_corrupt``. They are kept, not dropped.
     4. Remove duplicate ``event_id`` within this slice, keeping one copy deterministically.
        Duplicates against events already in silver are the MERGE's job, not this function's.
+    5. Flag ``is_unknown_user``: the normalized ``user_email`` matches no user in ``all_users``
+       (normalized with the same ``normalize_email``). Flagged, not dropped. A null email
+       matches nothing, so it is flagged too.
     """
     allowed = bronze.where((F.col("action") == C.ACTION_ALLOW) | _is_corrupt())
 
@@ -256,7 +265,26 @@ def traffic_events(bronze: DataFrame) -> DataFrame:
     ranked = parsed.withColumn("_copy", F.row_number().over(first_copy))
     # partitionBy puts every null event_id in ONE group; without the isNull branch, all rows
     # missing an id would collapse into a single row. Keep them all: they are not duplicates.
-    return ranked.where((F.col("_copy") == 1) | F.col("event_id").isNull()).drop("_copy")
+    deduped = ranked.where((F.col("_copy") == 1) | F.col("event_id").isNull()).drop("_copy")
+
+    # Same pattern as is_orphan in group_members: a left join keeps every event and adds a marker
+    # that is null when no user has this email. distinct() prevents fan-out (one email twice in
+    # the directory would otherwise duplicate the event). Join after dedup: fewer rows to join.
+    known_emails = (
+        all_users.select(normalize_email("email").alias("user_email"))
+        .distinct()
+        .withColumn("_user_found", F.lit(True))
+    )
+    flagged = deduped.join(known_emails, "user_email", "left")
+
+    # Joining on a column NAME moves user_email to the front (seen in latest_snapshot), so select
+    # the order explicitly: the data columns, the new flag, then the metadata columns last.
+    metadata = [SOURCE_COLUMN, BATCH_COLUMN, "ingest_ts"]
+    return flagged.select(
+        *[c for c in deduped.columns if c not in metadata],
+        F.col("_user_found").isNull().alias("is_unknown_user"),
+        *metadata,
+    )
 
 
 def users(bronze: DataFrame) -> DataFrame:

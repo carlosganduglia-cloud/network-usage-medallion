@@ -585,13 +585,14 @@ def _bronze_event(
     corrupt=None,
     event_time="2025-01-01T03:00:00Z",
     port="443",
+    email=" Alice@Corp.Example ",
 ):
     """One bronze traffic row with valid defaults; override only what a test is about."""
     source = f"traffic_logs/batch_date={batch_date}/part-0.csv"
     return (
         event_id,
         event_time,
-        " Alice@Corp.Example ",
+        email,
         "10.0.0.1",
         port,
         "tcp",
@@ -603,8 +604,10 @@ def _bronze_event(
     )
 
 
-def _events(spark, *rows):
-    return traffic_events(spark.createDataFrame(list(rows), BRONZE_TRAFFIC))
+def _events(spark, *rows, emails=("alice@corp.example",)):
+    """Run traffic_events; ``emails`` are the user directory's (raw) emails, all users known."""
+    all_users = spark.createDataFrame([(e,) for e in emails], "email string")
+    return traffic_events(spark.createDataFrame(list(rows), BRONZE_TRAFFIC), all_users)
 
 
 def test_traffic_events_parsed_take_plain_names_raw_kept(spark):
@@ -706,6 +709,63 @@ def test_traffic_events_does_not_collapse_null_event_ids(spark):
     result = _events(spark, _bronze_event(None), _bronze_event(None), _bronze_event("x"))
 
     assert result.count() == 3
+
+
+def test_traffic_events_known_user_matches_after_normalizing_both_sides(spark):
+    """Noise on both sides (case, spaces) must not make a real user look unknown."""
+    result = _events(spark, _bronze_event(), emails=(" ALICE@corp.example",))
+
+    assert result.first().is_unknown_user is False
+
+
+def test_traffic_events_flags_unknown_users_without_dropping_them(spark):
+    result = _events(
+        spark,
+        _bronze_event("known"),
+        _bronze_event("ghost", email="ghost00000001@corp.example"),
+        _bronze_event("no_email", email=None),
+        _bronze_event("blank", email="   "),  # normalize_email makes it null
+    )
+
+    flags = {r.event_id: r.is_unknown_user for r in result.collect()}
+    assert flags == {"known": False, "ghost": True, "no_email": True, "blank": True}
+
+
+def test_traffic_events_duplicate_directory_emails_do_not_multiply_events(spark):
+    """Two directory rows that normalize to the same email: still one row per event."""
+    emails = ("alice@corp.example", " Alice@Corp.Example")
+    result = _events(spark, _bronze_event("a"), _bronze_event("b"), emails=emails)
+
+    assert result.count() == 2
+
+
+def test_traffic_events_column_order(spark):
+    """The join must not move user_email first; the flag sits just before the metadata."""
+    columns = _events(spark, _bronze_event()).columns
+
+    assert columns[:2] == ["event_id", "event_time_raw"]
+    assert columns[-5:] == [
+        "is_corrupt",
+        "is_unknown_user",
+        "source_file",
+        "batch_date",
+        "ingest_ts",
+    ]
+    assert "_user_found" not in columns
+
+
+def test_traffic_events_unknown_users_on_generated_data(spark, tiny_landing):
+    """Exactly the planted ghost emails are unknown; disabled users' events are not."""
+    bronze = io.read_traffic_batches(spark, tiny_landing.root, tiny_landing.start, tiny_landing.end)
+    bronze = add_ingest_metadata(bronze, INGEST_TS)
+    all_users = latest_snapshot(_tiny_bronze(spark, tiny_landing, "users"))  # any status
+    events = traffic_events(bronze, all_users).where(~F.col("is_corrupt")).cache()
+
+    ghosts = events.where(F.col("user_email").startswith("ghost"))
+    assert ghosts.count() > 0
+    assert ghosts.where(~F.col("is_unknown_user")).count() == 0
+    assert events.where("is_unknown_user").count() == ghosts.count()  # and nothing else is
+    events.unpersist()
 
 
 # --- latest_snapshot -----------------------------------------------------------------------------
