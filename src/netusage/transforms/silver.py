@@ -364,3 +364,56 @@ def vpn_rules(bronze: DataFrame) -> DataFrame:
         BATCH_COLUMN,
         "ingest_ts",
     )
+
+
+def group_members(memberships: DataFrame, groups: DataFrame, all_users: DataFrame) -> DataFrame:
+    """Build silver group memberships from bronze ``ad_group_membership`` (all snapshots).
+
+    Inputs:
+    - ``memberships``: bronze ``ad_group_membership``, all snapshots (the rows transformed).
+    - ``groups``: silver ``ad_groups``, a lookup (only ``group_id`` is used).
+    - ``all_users``: EVERY user in the directory, active or not, e.g. ``latest_snapshot`` of
+      bronze ``users`` (only ``sys_id`` is used). Not silver ``users``: that table holds active
+      users only, and a disabled user's membership is not an orphan.
+
+    Steps, in order:
+    1. Keep the latest snapshot only.
+    2. Keep user members (``member_type == MEMBER_TYPE_USER``), a business filter; corrupt rows
+       are kept, flagged, as in the other tables.
+    3. Remove duplicate ``(group_id, member_id)`` rows. ``_corrupt_record`` is part of the key,
+       so clean rows are deduped among themselves (it is null for all of them) and a corrupt
+       row never replaces or hides a clean copy.
+    4. Flag ``is_orphan``: the group is not in ``groups`` or the member is not in ``all_users``.
+       Flagged, not dropped: the matching joins skip orphans on their own, and gold can count
+       them.
+    """
+    latest = latest_snapshot(memberships)
+    kept = latest.where((F.col("member_type") == C.MEMBER_TYPE_USER) | _is_corrupt())
+    # dropDuplicates keeps one row per key, but which one is not defined. Fine here: within one
+    # snapshot, copies of a membership can differ only in source_file (a diagnostic column).
+    deduped = kept.dropDuplicates(["group_id", "member_id", CORRUPT_COLUMN])
+
+    # A left join keeps every membership and adds the marker column; no match -> marker is null.
+    # distinct() makes each id appear once on the right: a duplicated key there would multiply
+    # the membership rows (fan-out) instead of just flagging them.
+    known_groups = groups.select("group_id").distinct().withColumn("_group_found", F.lit(True))
+    known_users = (
+        all_users.select(F.col("sys_id").alias("member_id"))
+        .distinct()
+        .withColumn("_member_found", F.lit(True))
+    )
+    flagged = deduped.join(known_groups, "group_id", "left").join(known_users, "member_id", "left")
+
+    is_orphan = F.col("_group_found").isNull() | F.col("_member_found").isNull()
+    return flagged.select(
+        "group_id",
+        "member_id",
+        "group_domain",
+        "member_type",
+        CORRUPT_COLUMN,
+        _is_corrupt().alias("is_corrupt"),
+        is_orphan.alias("is_orphan"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )

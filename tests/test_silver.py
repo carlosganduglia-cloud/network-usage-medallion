@@ -11,6 +11,7 @@ from netusage.transforms.bronze import add_ingest_metadata
 from netusage.transforms.silver import (
     ad_groups,
     apps,
+    group_members,
     ip_to_long,
     latest_snapshot,
     normalize_email,
@@ -1079,3 +1080,169 @@ def test_apps_and_ad_groups_on_generated_data(spark, tiny_landing):
     # ...while the name alone is not, which is why rules carry the domain too.
     assert groups.select("name").distinct().count() < total
     groups.unpersist()
+
+
+# --- group_members -------------------------------------------------------------------------------
+
+BRONZE_MEMBERSHIPS = (
+    "group_id string, member_id string, group_domain string, member_type string, "
+    "_corrupt_record string, source_file string, batch_date date, ingest_ts timestamp"
+)
+
+
+def _bronze_member(
+    group_id="g1",
+    member_id="u1",
+    member_type="user",
+    corrupt=None,
+    batch_date=SNAPSHOT_DATE,
+    source="ad_group_membership/part-0.csv",
+):
+    """One bronze membership row with valid defaults; override only what a test is about."""
+    return (
+        group_id,
+        member_id,
+        "corp.example",
+        member_type,
+        corrupt,
+        source,
+        batch_date,
+        INGEST_TS,
+    )
+
+
+def _members(spark, *rows, groups=("g1", "g2"), users=("u1", "u2")):
+    """Run group_members with small lookup tables: known group ids and known user sys_ids."""
+    memberships = spark.createDataFrame(list(rows), BRONZE_MEMBERSHIPS)
+    known_groups = spark.createDataFrame([(g,) for g in groups], "group_id string")
+    known_users = spark.createDataFrame([(u,) for u in users], "sys_id string")
+    return group_members(memberships, known_groups, known_users)
+
+
+def _pairs(df):
+    """Collect as {(group_id, member_id): (is_corrupt, is_orphan)}."""
+    return {(r.group_id, r.member_id): (r.is_corrupt, r.is_orphan) for r in df.collect()}
+
+
+def test_group_members_keeps_user_members_only(spark):
+    result = _members(
+        spark,
+        _bronze_member("g1", "u1", member_type="user"),
+        _bronze_member("g1", "cmp1", member_type="computer"),
+        _bronze_member("g1", "u2", member_type=None),
+    )
+
+    assert _pairs(result) == {("g1", "u1"): (False, False)}
+
+
+def test_group_members_removes_exact_duplicates(spark):
+    result = _members(
+        spark,
+        _bronze_member("g1", "u1"),
+        _bronze_member("g1", "u1"),
+        _bronze_member("g1", "u1", source="ad_group_membership/part-1.csv"),  # other file
+        _bronze_member("g2", "u1"),
+    )
+
+    assert result.count() == 2
+    assert set(_pairs(result)) == {("g1", "u1"), ("g2", "u1")}
+
+
+def test_group_members_corrupt_row_does_not_replace_clean_copy(spark):
+    """Same (group, member) once clean and once corrupt: both stay, only one is flagged."""
+    result = _members(
+        spark,
+        _bronze_member("g1", "u1"),
+        _bronze_member("g1", "u1", corrupt="g1,u1,corp.example,user,EXTRA"),
+    )
+
+    flags = sorted(r.is_corrupt for r in result.collect())
+    assert flags == [False, True]
+
+
+def test_group_members_keeps_corrupt_rows_with_null_columns(spark):
+    """Two different unparseable lines: all-null columns, but neither is dropped or merged."""
+    result = _members(
+        spark,
+        _bronze_member(None, None, member_type=None, corrupt="broken line 1"),
+        _bronze_member(None, None, member_type=None, corrupt="broken line 2"),
+    )
+
+    assert result.count() == 2
+    assert all(r.is_corrupt for r in result.collect())
+
+
+def test_group_members_flags_orphans_without_dropping_them(spark):
+    result = _members(
+        spark,
+        _bronze_member("g1", "u1"),  # both known
+        _bronze_member("grp-missing", "u1"),  # unknown group
+        _bronze_member("g1", "usr-missing"),  # unknown member
+        _bronze_member("grp-missing", "usr-missing"),  # both unknown
+    )
+
+    assert _pairs(result) == {
+        ("g1", "u1"): (False, False),
+        ("grp-missing", "u1"): (False, True),
+        ("g1", "usr-missing"): (False, True),
+        ("grp-missing", "usr-missing"): (False, True),
+    }
+
+
+def test_group_members_duplicate_lookup_keys_do_not_multiply_rows(spark):
+    """A key twice in a lookup table must flag the membership, not duplicate it (fan-out)."""
+    result = _members(spark, _bronze_member("g1", "u1"), groups=("g1", "g1"), users=("u1", "u1"))
+
+    assert result.count() == 1
+
+
+def test_group_members_latest_snapshot_only(spark):
+    result = _members(
+        spark,
+        _bronze_member("g1", "u1", batch_date=date(2025, 1, 1)),
+        _bronze_member("g2", "u2"),
+    )
+
+    assert set(_pairs(result)) == {("g2", "u2")}
+
+
+def test_group_members_schema(spark):
+    result = _members(spark, _bronze_member())
+
+    assert result.columns == [
+        "group_id",
+        "member_id",
+        "group_domain",
+        "member_type",
+        "_corrupt_record",
+        "is_corrupt",
+        "is_orphan",
+        "source_file",
+        "batch_date",
+        "ingest_ts",
+    ]
+    assert dict(result.dtypes)["is_orphan"] == "boolean"
+
+
+def test_group_members_on_generated_data(spark, tiny_landing):
+    memberships = _tiny_bronze(spark, tiny_landing, "ad_group_membership")
+    groups = ad_groups(_tiny_bronze(spark, tiny_landing, "ad_group"))
+    all_users = latest_snapshot(_tiny_bronze(spark, tiny_landing, "users"))  # any status
+    silver = group_members(memberships, groups, all_users).cache()
+
+    rows = silver.count()
+    clean = silver.where(~F.col("is_corrupt"))
+    # No duplicate pair is left among clean rows, and only user members remain.
+    assert clean.select("group_id", "member_id").distinct().count() == clean.count()
+    assert silver.where(F.col("member_type") != C.MEMBER_TYPE_USER).count() == 0
+    # The generator plants malformed rows; they survive, flagged.
+    assert silver.where("is_corrupt").count() > 0
+    # Planted orphans are flagged: unknown groups and members carry a "-missing-" id.
+    planted = silver.where(
+        F.col("group_id").contains("-missing-") | F.col("member_id").contains("-missing-")
+    )
+    assert planted.count() > 0
+    assert planted.where(~F.col("is_orphan")).count() == 0
+    assert silver.where("is_orphan").count() == planted.count()  # and nothing else is
+    assert rows < memberships.count()  # non-user members and duplicates removed
+    silver.unpersist()
