@@ -2,13 +2,14 @@
 
 from datetime import UTC, date, datetime
 
-from pyspark.sql import Row
+from pyspark.sql import Row, Window
 from pyspark.sql import functions as F
 
 from netusage import config as C
 from netusage import io
 from netusage.transforms.bronze import add_ingest_metadata
 from netusage.transforms.silver import (
+    IPV4_MAX,
     ad_groups,
     apps,
     group_members,
@@ -19,6 +20,7 @@ from netusage.transforms.silver import (
     normalize_protocol,
     parse_event_time,
     port_to_int,
+    resolution_states,
     traffic_events,
     users,
     utc_date,
@@ -1245,4 +1247,151 @@ def test_group_members_on_generated_data(spark, tiny_landing):
     assert planted.where(~F.col("is_orphan")).count() == 0
     assert silver.where("is_orphan").count() == planted.count()  # and nothing else is
     assert rows < memberships.count()  # non-user members and duplicates removed
+    silver.unpersist()
+
+
+# --- resolution_states ---------------------------------------------------------------------------
+
+BRONZE_RESOLUTIONS = (
+    "resource_name string, state_id string, ip_start bigint, ip_end bigint, "
+    "first_seen timestamp, last_seen timestamp, source_file string, batch_date date, "
+    "ingest_ts timestamp"
+)
+JAN_1 = datetime(2025, 1, 1, tzinfo=UTC)
+JAN_2 = datetime(2025, 1, 2, tzinfo=UTC)
+
+
+def _bronze_state(
+    state_id="s1",
+    ip_start=167772161,  # 10.0.0.1
+    ip_end=167772161,
+    first_seen=JAN_1,
+    last_seen=JAN_2,
+    batch_date=SNAPSHOT_DATE,
+):
+    """One bronze resolution row with valid defaults; override only what a test is about."""
+    return (
+        "srv-db-0001",
+        state_id,
+        ip_start,
+        ip_end,
+        first_seen,
+        last_seen,
+        "resource_resolution/part-0.parquet",
+        batch_date,
+        INGEST_TS,
+    )
+
+
+def _states(spark, *rows):
+    return resolution_states(spark.createDataFrame(list(rows), BRONZE_RESOLUTIONS))
+
+
+def _flags(df, column):
+    return {r.state_id: r[column] for r in df.collect()}
+
+
+def test_resolution_states_valid_rows(spark):
+    result = _states(
+        spark,
+        _bronze_state("single_ip"),
+        _bronze_state("subnet", ip_start=167772160, ip_end=167772415),  # 10.0.0.0/24
+        _bronze_state("current", last_seen=None),  # NULL last_seen = current state
+        _bronze_state("whole_space", ip_start=0, ip_end=IPV4_MAX),
+    )
+
+    assert all(r.ip_range_valid and r.period_valid for r in result.collect())
+    assert result.count() == 4
+
+
+def test_resolution_states_invalid_ip_ranges_flagged_not_dropped(spark):
+    result = _states(
+        spark,
+        _bronze_state("ok"),
+        _bronze_state("reversed", ip_start=20, ip_end=10),
+        _bronze_state("negative", ip_start=-1, ip_end=10),
+        _bronze_state("above_ipv4", ip_start=10, ip_end=IPV4_MAX + 1),
+        _bronze_state("no_start", ip_start=None),
+        _bronze_state("no_end", ip_end=None),
+    )
+
+    assert _flags(result, "ip_range_valid") == {
+        "ok": True,
+        "reversed": False,
+        "negative": False,
+        "above_ipv4": False,
+        "no_start": False,  # null, not None: coalesce keeps the flag strictly boolean
+        "no_end": False,
+    }
+
+
+def test_resolution_states_invalid_periods_flagged_not_dropped(spark):
+    result = _states(
+        spark,
+        _bronze_state("ok"),
+        _bronze_state("current", last_seen=None),
+        _bronze_state("empty", first_seen=JAN_1, last_seen=JAN_1),  # [t, t) contains nothing
+        _bronze_state("reversed", first_seen=JAN_2, last_seen=JAN_1),
+        _bronze_state("no_start", first_seen=None),
+    )
+
+    assert _flags(result, "period_valid") == {
+        "ok": True,
+        "current": True,
+        "empty": False,
+        "reversed": False,
+        "no_start": False,
+    }
+
+
+def test_resolution_states_latest_snapshot_only(spark):
+    result = _states(
+        spark,
+        _bronze_state("old", batch_date=date(2025, 1, 1)),
+        _bronze_state("new"),
+    )
+
+    assert [r.state_id for r in result.collect()] == ["new"]
+
+
+def test_resolution_states_schema(spark):
+    result = _states(spark, _bronze_state())
+
+    assert result.columns == [
+        "resource_name",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        "ip_range_valid",
+        "period_valid",
+        "source_file",
+        "batch_date",
+        "ingest_ts",
+    ]
+    types = dict(result.dtypes)
+    assert (types["ip_start"], types["ip_end"]) == ("bigint", "bigint")
+    assert (types["ip_range_valid"], types["period_valid"]) == ("boolean", "boolean")
+
+
+def test_resolution_states_on_generated_data(spark, tiny_landing):
+    bronze = _tiny_bronze(spark, tiny_landing, "resource_resolution")
+    silver = resolution_states(bronze).cache()
+
+    assert silver.count() == bronze.count()
+    assert silver.where(~F.col("ip_range_valid") | ~F.col("period_valid")).count() == 0
+
+    # What the matching join relies on, per resource (one row per state, not per IP range):
+    states = silver.select("resource_name", "state_id", "first_seen", "last_seen").distinct()
+    # 1. Exactly one current state.
+    current = states.groupBy("resource_name").agg(
+        F.sum(F.col("last_seen").isNull().cast("int")).alias("n_current")
+    )
+    assert current.where(F.col("n_current") != 1).count() == 0
+    # 2. States do not overlap: each one starts at or after the previous one ended.
+    #    partitionBy(resource_name): each resource is ordered on its own, in parallel.
+    by_resource = Window.partitionBy("resource_name").orderBy("first_seen")
+    ordered = states.withColumn("prev_last_seen", F.lag("last_seen").over(by_resource))
+    assert ordered.where(F.col("first_seen") < F.col("prev_last_seen")).count() == 0
     silver.unpersist()
