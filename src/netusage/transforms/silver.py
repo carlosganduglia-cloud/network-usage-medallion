@@ -417,3 +417,48 @@ def group_members(memberships: DataFrame, groups: DataFrame, all_users: DataFram
         BATCH_COLUMN,
         "ingest_ts",
     )
+
+
+# The largest IPv4 address as an integer (255.255.255.255), the upper bound of ip_to_long.
+IPV4_MAX = 256**4 - 1
+
+
+def resolution_states(bronze: DataFrame) -> DataFrame:
+    """Build silver resolution states from bronze ``resource_resolution`` (all snapshots).
+
+    One row per (resource, state, IP range): a state is the set of IP ranges a resource resolved
+    to during ``[first_seen, last_seen)``; ``last_seen`` NULL means the state is current.
+
+    Steps, in order:
+    1. Keep the latest snapshot only. Each snapshot holds the full history of states.
+    2. Add validity flags; rows are flagged, not dropped:
+       - ``ip_range_valid``: both ends present and ``0 <= ip_start <= ip_end <= IPV4_MAX``.
+       - ``period_valid``: ``first_seen`` present and, unless the state is current,
+         ``first_seen < last_seen`` (half-open: an empty or reversed period can match nothing).
+
+    Parquet is typed, so there is nothing to parse and no ``_corrupt_record``: a file that does
+    not match the schema fails the read instead. Disjointness BETWEEN states of a resource is a
+    property of the whole table, not of a row; ``validation.py`` and the tests check it.
+    """
+    ip_start, ip_end = F.col("ip_start"), F.col("ip_end")
+    first_seen, last_seen = F.col("first_seen"), F.col("last_seen")
+
+    ip_range_valid = F.coalesce(
+        (ip_start >= 0) & (ip_start <= ip_end) & (ip_end <= IPV4_MAX), F.lit(False)
+    )
+    period_valid = F.coalesce(
+        first_seen.isNotNull() & (last_seen.isNull() | (first_seen < last_seen)), F.lit(False)
+    )
+    return latest_snapshot(bronze).select(
+        "resource_name",
+        "state_id",
+        "ip_start",
+        "ip_end",
+        "first_seen",
+        "last_seen",
+        ip_range_valid.alias("ip_range_valid"),
+        period_valid.alias("period_valid"),
+        SOURCE_COLUMN,
+        BATCH_COLUMN,
+        "ingest_ts",
+    )
